@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"maps"
 	"math/big"
 	"net"
@@ -64,6 +65,70 @@ func TestLoadConfigServers(t *testing.T) {
 	}
 }
 
+func TestLoadConfigSambaServers(t *testing.T) {
+	load := func(text string) (config, error) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return loadConfig(dir)
+	}
+	cfg, err := load("samba_servers:\n  - FS3.corp.example\n  - fs3.corp.example\n  - fs4.corp.example\nroots:\n  - id: a\n    path: \\\\fs01.corp.example\\a\n  - id: b\n    path: \\\\files.corp.example\\b\n    server: samba\n  - id: c\n    path: \\\\fs4.corp.example\\c\n    server: samba\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !maps.Equal(cfg.samba, map[string]bool{"files.corp.example": true, "fs3.corp.example": true, "fs4.corp.example": true}) {
+		t.Fatalf("samba %v", cfg.samba)
+	}
+	if _, err := load("samba_servers:\n  - FS01.corp.example\nroots:\n  - id: a\n    path: \\\\fs01.corp.example\\a\n"); err == nil || !strings.Contains(err.Error(), "host fs01.corp.example is listed in samba_servers and has roots with server windows") {
+		t.Fatalf("conflict with a windows root: %v", err)
+	}
+	if _, err := load("samba_servers:\n  - fs01.corp.example\nroots:\n  - id: a\n    path: \\\\fs01.corp.example\\a\n    server: windows\n"); err == nil {
+		t.Fatal("conflict with an explicit windows root accepted")
+	}
+	for _, host := range []string{"fs3", "10.0.0.1", "fs3.corp.", "fs3.corp:445", "fs3.123", "-fs3.corp", "\"\""} {
+		if _, err := load("samba_servers:\n  - " + host + "\nroots:\n  - id: a\n    path: \\\\fs01.corp.example\\a\n"); err == nil {
+			t.Errorf("samba_servers entry %s accepted", host)
+		}
+	}
+}
+
+func TestCheckReportsTarget(t *testing.T) {
+	dir := t.TempDir()
+	text := "roots:\n  - id: ns\n    path: \\\\corp.example\\ns\n  - id: plain\n    path: \\\\fs01.corp.example\\p\n  - id: bad\n    path: \\\\corp.example\\bad\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	src := newFakeSource()
+	src.referrals[`\\corp.example\ns`] = Referral{Consumed: `\\corp.example\ns`, Sets: [][]string{{`\\NS1.corp.example\ns`}}}
+	src.referrals[`\\ns1.corp.example\ns`] = Referral{Consumed: `\\NS1.corp.example\ns`, Sets: [][]string{{`\\NS1.corp.example\ns`}}}
+	src.failures[`referral:\\corp.example\bad`] = ErrDenied
+	saved := host
+	host.Source = func(string, string, map[string]bool) (Source, error) { return src, nil }
+	defer func() { host = saved }()
+	stdout := os.Stdout
+	reader, writer, _ := os.Pipe()
+	os.Stdout = writer
+	err := check(dir)
+	writer.Close()
+	os.Stdout = stdout
+	output, _ := io.ReadAll(reader)
+	for _, line := range []string{"ok   root ns list\n", "ok   root ns target \\\\NS1.corp.example\\ns\n", "ok   root ns authz\n", "ok   root plain list\n", "ok   root plain authz\n", "fail root bad list: denied\n"} {
+		if !strings.Contains(string(output), line) {
+			t.Errorf("missing %q in\n%s", line, output)
+		}
+	}
+	if err == nil || strings.Contains(string(output), "root plain target") || strings.Contains(string(output), "root bad share") {
+		t.Fatalf("check %v\n%s", err, output)
+	}
+	if shares := src.called("share:"); !slices.Equal(shares, []string{`\\ns1.corp.example\ns`, `\\fs01.corp.example\p`}) {
+		t.Fatalf("shares %v", shares)
+	}
+	if servers := []string{src.authzCalls[0][0], src.authzCalls[1][0]}; !slices.Equal(servers, []string{"NS1.corp.example", "fs01.corp.example"}) {
+		t.Fatalf("authz %v", src.authzCalls)
+	}
+}
+
 type fakeFile struct {
 	data     []byte
 	id       uint64
@@ -84,10 +149,25 @@ type fakeSource struct {
 	filters         []string
 	authzCalls      [][]string
 	tokens          map[string]Token
+	referrals       map[string]Referral
+	links           map[string]bool
+	calls           []string
 }
 
 func newFakeSource() *fakeSource {
-	return &fakeSource{files: map[string]*fakeFile{}, shares: map[string][]byte{}, failures: map[string]error{}}
+	return &fakeSource{files: map[string]*fakeFile{}, shares: map[string][]byte{}, failures: map[string]error{}, referrals: map[string]Referral{}, links: map[string]bool{}}
+}
+
+func (s *fakeSource) called(prefix string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var found []string
+	for _, call := range s.calls {
+		if rest, ok := strings.CutPrefix(call, prefix); ok {
+			found = append(found, rest)
+		}
+	}
+	return found
 }
 
 func (s *fakeSource) add(unc, content string, sd []byte) *fakeFile {
@@ -101,11 +181,18 @@ func (s *fakeSource) add(unc, content string, sd []byte) *fakeFile {
 func (s *fakeSource) List(dir string) ([]Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.calls = append(s.calls, "list:"+dir)
 	if err := s.failures["list:"+dir]; err != nil {
 		return nil, err
 	}
 	seen := map[string]bool{}
 	var entries []Entry
+	for unc := range s.links {
+		if name, ok := strings.CutPrefix(unc, dir+`\`); ok && !strings.Contains(name, `\`) {
+			seen[name] = true
+			entries = append(entries, Entry{Name: name, Dir: true, Link: true})
+		}
+	}
 	for unc, f := range s.files {
 		rest, ok := strings.CutPrefix(unc, dir+`\`)
 		if !ok {
@@ -146,6 +233,7 @@ func (s *fakeSource) Descriptor(unc string) ([]byte, uint64, error) {
 func (s *fakeSource) Share(rootPath string) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.calls = append(s.calls, "share:"+rootPath)
 	if err := s.failures["share:"+rootPath]; err != nil {
 		return nil, err
 	}
@@ -215,6 +303,7 @@ func (s *fakeSource) Open(rootPath, rel string) (File, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	unc := rootPath + `\` + rel
+	s.calls = append(s.calls, "open:"+unc)
 	if err := s.failures["open:"+unc]; err != nil {
 		return nil, err
 	}
@@ -226,6 +315,15 @@ func (s *fakeSource) Open(rootPath, rel string) (File, error) {
 }
 
 func (s *fakeSource) Referral(unc string) (Referral, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, "referral:"+unc)
+	if err := s.failures["referral:"+strings.ToLower(unc)]; err != nil {
+		return Referral{}, err
+	}
+	if ref, ok := s.referrals[strings.ToLower(unc)]; ok {
+		return ref, nil
+	}
 	return Referral{}, ErrNotFound
 }
 
@@ -359,6 +457,7 @@ func enrolledAgent(t *testing.T, ca testCA, link string, cfg config, src Source,
 	if err != nil {
 		t.Fatal(err)
 	}
+	walkedMounts(a)
 	a.id = id
 	a.cert.Store(&tls.Certificate{Certificate: [][]byte{cert.Raw}, PrivateKey: key, Leaf: cert})
 	return a

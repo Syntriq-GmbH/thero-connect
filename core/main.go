@@ -25,11 +25,12 @@ import (
 var version = "dev"
 
 type config struct {
-	Proxy     string `yaml:"proxy"`
-	Principal string `yaml:"principal"`
-	Roots     []root `yaml:"roots"`
-	Limits    limits `yaml:"limits"`
-	samba     map[string]bool
+	Proxy        string   `yaml:"proxy"`
+	Principal    string   `yaml:"principal"`
+	SambaServers []string `yaml:"samba_servers"`
+	Roots        []root   `yaml:"roots"`
+	Limits       limits   `yaml:"limits"`
+	samba        map[string]bool
 }
 
 type root struct {
@@ -183,14 +184,21 @@ func check(dir string) error {
 	}
 	src, err := host.Source(dir, cfg.Principal, cfg.samba)
 	if report("source", err) {
+		probe := &agent{cfg: cfg, src: src}
 		for _, r := range cfg.Roots {
-			_, err := src.List(r.Path)
-			report("root "+r.ID+" list", err)
-			share, err := src.Share(r.Path)
+			budget := 16
+			target, _, err := probe.locate(r.Path, "", map[string]string{}, &budget)
+			if !report("root "+r.ID+" list", err) {
+				continue
+			}
+			if target != r.Path {
+				report("root "+r.ID+" target "+target, nil)
+			}
+			share, err := src.Share(shareOf(target))
 			if !report("root "+r.ID+" share", err) || !report("root "+r.ID+" share descriptor", supported(share)) {
 				continue
 			}
-			server, _, _ := SplitUNC(r.Path)
+			server, _, _ := SplitUNC(target)
 			_, err = src.Allowed(server, nil, [][]byte{share})
 			report("root "+r.ID+" authz", err)
 		}
@@ -261,6 +269,16 @@ func loadConfig(dir string) (config, error) {
 				return config{}, fmt.Errorf("config.yaml: root %s: exclude %q: %w", r.ID, pattern, err)
 			}
 		}
+	}
+	for _, name := range cfg.SambaServers {
+		name = strings.ToLower(name)
+		if !validHost(name) {
+			return config{}, fmt.Errorf("config.yaml: samba_servers: invalid host %q", name)
+		}
+		if servers[name] == "windows" {
+			return config{}, fmt.Errorf("config.yaml: host %s is listed in samba_servers and has roots with server windows", name)
+		}
+		cfg.samba[name] = true
 	}
 	if cfg.Limits.MaxFileMB < 0 || cfg.Limits.MaxGBPerDay < 0 || cfg.Limits.MaxMbit < 0 {
 		return config{}, errors.New("config.yaml: limits must not be negative")
