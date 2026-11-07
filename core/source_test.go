@@ -461,3 +461,64 @@ func TestDeniedSIDs(t *testing.T) {
 		t.Fatalf("DeniedSIDs(nil) = %v", got)
 	}
 }
+
+func TestValidHost(t *testing.T) {
+	cases := map[string]bool{
+		"fs1.corp.example":                        true,
+		"FS-01.Corp.Example":                      true,
+		"a.b":                                     true,
+		"x1.2b":                                   true,
+		strings.Repeat("a", 63) + ".corp":         true,
+		strings.Repeat("a", 64) + ".corp":         false,
+		strings.Repeat("abcdefg.", 31) + "ab":     true,
+		strings.Repeat("abcdefg.", 31) + "abcdef": false,
+		"single":                                  false,
+		"":                                        false,
+		"fs1.corp.":                               false,
+		".corp":                                   false,
+		"fs1..corp":                               false,
+		"-fs1.corp":                               false,
+		"fs1-.corp":                               false,
+		"fs1.-corp":                               false,
+		"10.0.0.1":                                false,
+		"fs1.123":                                 false,
+		"::1":                                     false,
+		"fe80::1.corp":                            false,
+		"fs1.corp@SSL@443":                        false,
+		"fs1.corp:445":                            false,
+		"fs_1.corp":                               false,
+		"fs 1.corp":                               false,
+		"fs1.cörp":                                false,
+		"fs1.corp\x00":                            false,
+	}
+	for host, want := range cases {
+		if got := validHost(host); got != want {
+			t.Errorf("validHost(%q) = %v, want %v", host, got, want)
+		}
+	}
+}
+
+func TestShareOfBindScope(t *testing.T) {
+	shares := map[string]string{
+		`\\FS2.Corp\Docs`:         `\\fs2.corp\docs`,
+		`\\fs2.corp\docs\Sub\Dir`: `\\fs2.corp\docs`,
+		`\\fs2.corp`:              "",
+		`fs2.corp\docs`:           "",
+		"":                        "",
+	}
+	for unc, want := range shares {
+		if got := shareOf(unc); got != want {
+			t.Errorf("shareOf(%q) = %q, want %q", unc, got, want)
+		}
+	}
+	if bind("") != 0 || bind(`\\fs2.corp\docs`) != 0x54216a4ac85adc58 || bind(`\\fs3.corp\docs`) == bind(`\\fs2.corp\docs`) {
+		t.Fatalf("bind %016x %016x", bind(`\\fs2.corp\docs`), bind(`\\fs3.corp\docs`))
+	}
+	if scope("ns", "") != "ns" || scope("ns", `\\fs2.corp\docs`) != "ns\x00\\\\fs2.corp\\docs" {
+		t.Fatalf("scope %q", scope("ns", `\\fs2.corp\docs`))
+	}
+	sd := readable("S-1-5-21-1-2-3-1104")
+	if classOf(scope("ns", ""), sd) != classOf("ns", sd) || classOf(scope("ns", `\\fs2.corp\docs`), sd) == classOf(scope("ns", `\\fs3.corp\docs`), sd) {
+		t.Fatal("scope does not separate targets or changes plain roots")
+	}
+}

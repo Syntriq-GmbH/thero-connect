@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"path"
 	"slices"
 	"strconv"
@@ -119,6 +120,47 @@ func SplitUNC(unc string) (string, string, error) {
 		return "", "", fmt.Errorf("%q is not a UNC path", unc)
 	}
 	return parts[0], parts[1], nil
+}
+
+func shareOf(unc string) string {
+	host, share, err := SplitUNC(unc)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(`\\` + host + `\` + share)
+}
+
+func bind(key string) uint64 {
+	if key == "" {
+		return 0
+	}
+	sum := sha256.Sum256([]byte("thero-connect/1\x00" + key))
+	return binary.BigEndian.Uint64(sum[:8])
+}
+
+func scope(root, key string) string {
+	if key == "" {
+		return root
+	}
+	return root + "\x00" + key
+}
+
+func validHost(host string) bool {
+	labels := strings.Split(host, ".")
+	if len(host) > 253 || len(labels) < 2 || net.ParseIP(host) != nil {
+		return false
+	}
+	for _, label := range labels {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' {
+				return false
+			}
+		}
+	}
+	return strings.Trim(labels[len(labels)-1], "0123456789") != ""
 }
 
 func excluded(patterns []string, rel string) bool {
