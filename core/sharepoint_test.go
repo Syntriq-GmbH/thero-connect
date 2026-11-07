@@ -1062,9 +1062,9 @@ func TestSiteWalkPaging(t *testing.T) {
 	if f.count(docs.id+"')/items?") != 3 || f.count("p_ID=5000") != 1 || f.count("p_ID=10000") != 1 || f.count(tickets.id+"')/items?") != 3 || f.count("$top=1000") != 3 {
 		t.Fatalf("item requests: library %d, generic %d", f.count(docs.id+"')/items?"), f.count(tickets.id+"')/items?"))
 	}
-	previous := pageTime
-	pageTime = 30 * time.Millisecond
-	t.Cleanup(func() { pageTime = previous })
+	previous := sitePageTime
+	sitePageTime = 30 * time.Millisecond
+	t.Cleanup(func() { sitePageTime = previous })
 	f.update(func() { f.delay = func(*http.Request) time.Duration { return 20 * time.Millisecond } })
 	slow := walkSite(t, a, false)
 	empty := 0
@@ -1424,9 +1424,9 @@ func TestChanges(t *testing.T) {
 		f.fault = nil
 		f.delay = func(r *http.Request) time.Duration { return 50 * time.Millisecond }
 	})
-	previousPage := pageTime
-	pageTime = 20 * time.Millisecond
-	t.Cleanup(func() { pageTime = previousPage })
+	previousPage := sitePageTime
+	sitePageTime = 20 * time.Millisecond
+	t.Cleanup(func() { sitePageTime = previousPage })
 	first := a.walk(message{Type: "walk", ID: 1, Root: "intranet"}).(pageMessage)
 	if first.Cursor == "" {
 		t.Fatal("slow full walk finished at once")
@@ -1631,9 +1631,9 @@ func TestChangesCommit(t *testing.T) {
 	}
 	f.file(docs, "late.txt", "l")
 	f.change(map[string]any{"ListId": docs.id, "ItemId": 1000})
-	previous := pageTime
-	pageTime = 20 * time.Millisecond
-	t.Cleanup(func() { pageTime = previous })
+	previous := sitePageTime
+	sitePageTime = 20 * time.Millisecond
+	t.Cleanup(func() { sitePageTime = previous })
 	f.update(func() { f.delay = func(*http.Request) time.Duration { return 30 * time.Millisecond } })
 	running := a.walk(message{Type: "walk", ID: 1, Root: "intranet", Changes: true}).(pageMessage)
 	full := a.walk(message{Type: "walk", ID: 1, Root: "intranet"}).(pageMessage)

@@ -41,10 +41,10 @@ const (
 )
 
 var (
-	siteRoots  *x509.CertPool
-	pageTime   = 60 * time.Second
-	accessTime = 300 * time.Second
-	retryPause = func(ctx context.Context, wait time.Duration) error {
+	siteRoots    *x509.CertPool
+	sitePageTime = 60 * time.Second
+	accessTime   = 300 * time.Second
+	retryPause   = func(ctx context.Context, wait time.Duration) error {
 		timer := time.NewTimer(wait)
 		defer timer.Stop()
 		select {
@@ -1280,12 +1280,12 @@ func (a *agent) siteWalk(m message, r root) any {
 		st.fullSeen = a.now()
 	}
 	s.mu.Unlock()
-	w.until.Store(time.Now().Add(pageTime).UnixNano())
+	w.until.Store(time.Now().Add(sitePageTime).UnixNano())
 	select {
 	case w.wake <- struct{}{}:
 	default:
 	}
-	timer := time.NewTimer(pageTime)
+	timer := time.NewTimer(sitePageTime)
 	select {
 	case <-w.done:
 	case <-timer.C:
