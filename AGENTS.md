@@ -47,12 +47,14 @@ GOOS=linux GOARCH=arm64 go vet ./...
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o thero-connect-linux-arm64 ./linux
 go vet -tags e2e ./...
 go vet -tags samba ./...
+GOOS=windows GOARCH=amd64 go vet -tags dfs ./windows
 SMB_E2E_URL=wss://<host> SMB_E2E_CA=<fingerprint> SMB_E2E_TOKEN=<token> go test -tags e2e -run TestE2E -count=1 -timeout 0 ./core
-test/samba/run.sh up && test/samba/run.sh fresh && test/samba/run.sh truth && test/samba/run.sh test && test/samba/run.sh idmap
+test/samba/run.sh up && test/samba/run.sh fresh && test/samba/run.sh truth && test/samba/run.sh test && test/samba/run.sh dfs && test/samba/run.sh idmap
+test/samba/run.sh stop fs2 && test/samba/run.sh start fs2
 test/samba/run.sh down
 ```
 
-`TestE2E` enrolls against a running Thero server and keeps the link for `SMB_E2E_SECONDS` (default 900); without `SMB_E2E_URL` it skips. `run.sh idmap` leaves the file server with a cut idmap range; run `up` again before another `test`. One lab runs per Docker project: set `THERO_SMB_PROJECT` (default `thero-smb`) and `THERO_SMB_NET`, the first three octets of a free /24 (default `172.30.53`), to run a second lab or to avoid an overlapping network.
+`TestE2E` enrolls against a running Thero server and keeps the link for `SMB_E2E_SECONDS` (default 900); without `SMB_E2E_URL` it skips. `run.sh idmap` leaves the file server with a cut idmap range; run `up` again before another `test`. `run.sh dfs` runs `TestSambaDFS` against the namespace shares `ns` and `ns2` and the domain namespace `corp`. `run.sh stop <service>` and `run.sh start <service>` stop and start one lab container, for example `fs2` to take a link target down. One lab runs per Docker project: set `THERO_SMB_PROJECT` (default `thero-smb`) and `THERO_SMB_NET`, the first three octets of a free /24 (default `172.30.53`), to run a second lab or to avoid an overlapping network.
 
 ## Layout
 
@@ -60,24 +62,25 @@ One module, a shared `core` package and one `package main` folder per platform.
 
 - `core/main.go`: `Platform` (what a platform supplies), `Main`, command dispatch, flags, the `check` command, `config.yaml` loading and validation, state paths, atomic file writes, logger setup.
 - `core/link.go`: protocol structs, TLS, `enroll`, `serve` with the reconnect loop, one link session, certificate renewal.
-- `core/ops.go`: the handlers `walk`, `principals`, `access` and `read`, walk state, class registry (`classes.json`), last complete walk per root (`walks.json`), daily quota (`quota.json`), rate limiter, read window.
+- `core/ops.go`: the handlers `walk`, `principals`, `access` and `read`, walk state, DFS resolution (`locate`, `physical`), class registry (`classes.json`), last complete walk per root (`walks.json`), link targets of the last complete walk (`mounts.json`), daily quota (`quota.json`), rate limiter, read window.
 - `core/source.go`: the `Source` and `File` interfaces, portable types, sentinel errors and the pure helpers (paths, UNC, SIDs, FILETIME, accounts from directory values, excludes, descriptors, classes, LDAP filter, account matching, error codes).
 - `core/link_test.go`: `TestMain` with a plain `Platform`, `fakeSource` and in-process TLS link server tests.
-- `core/ops_test.go`: handler tests on `fakeSource`.
+- `core/ops_test.go`: handler tests on `fakeSource`, including the DFS walk, access and read tests (`TestWalk*`, `TestAccessPerTarget`, `TestReadThroughMounts`, `TestStateMountsAndTargets`).
 - `core/source_test.go`: table tests of the pure helpers, golden class ids and security descriptor builders.
 - `core/protocol_test.go`: fixture round trip, protocol digest, chunk layout.
 - `core/e2e_test.go`: real enrollment and link against a running Thero server (`-tags e2e`).
 - `windows/main.go`: `main`, DPAPI, service, folder ACLs, install, uninstall, event log.
 - `windows/source.go`: `windowsSource`, the Windows `Source`.
-- `windows/source_test.go`: struct layout, DLL export and share tests, run on the Windows CI jobs.
+- `windows/source_test.go`: struct layout, DLL export, share, physical-name guard, link detection and referral mapping tests, run on the Windows CI jobs.
+- `windows/dfs_test.go`: `TestDfsNamespace` against a standalone namespace on the runner (`-tags dfs`, CI job `windows-dfs`).
 - `windows/README.md`: Windows requirements, rights, install, operations.
 - `linux/main.go`: `main`, folder ownership and modes, install, uninstall, the systemd unit.
-- `linux/source.go`: the Linux `Source`: Kerberos login, SMB file plane, share descriptors over srvsvc, MS-RAA for Windows file servers, the token and `core.Grants` for Samba file servers.
+- `linux/source.go`: the Linux `Source`: Kerberos login, SMB file plane, DFS referrals, share descriptors over srvsvc, MS-RAA for Windows file servers, the token and `core.Grants` for Samba file servers.
 - `linux/directory.go`: domain controller lookup, LDAP with a sealed GSSAPI bind, accounts, own SID and token facts.
 - `linux/main_test.go`, `linux/source_test.go`: unit tests that run on macOS and Linux.
-- `linux/samba_test.go`: access matrix against the Samba lab (`-tags samba`, driven by `test/samba/run.sh`).
+- `linux/samba_test.go`: access matrix (`TestSamba`) and DFS referrals and readers (`TestSambaDFS`) against the Samba lab (`-tags samba`, driven by `test/samba/run.sh`).
 - `linux/README.md`: Linux requirements, keytab, rights, Samba prerequisites, install, operations, limits.
-- `test/samba/`: Samba Active Directory lab in Docker (`compose.yaml`, `run.sh`). Its passwords are lab values only.
+- `test/samba/`: Samba Active Directory lab in Docker (`compose.yaml`, `run.sh`) with two file servers and DFS namespaces. Its passwords are lab values only.
 - `protocol/v1/`: the canonical protocol.
 
 ## Protocol
@@ -86,7 +89,7 @@ One module, a shared `core` package and one `package main` folder per platform.
 
 ## Testing
 
-Portable logic in `core` runs on macOS and Linux through `fakeSource`. Windows code is vetted and built with `GOOS=windows` for amd64 and arm64, and its tests run on the Windows CI jobs (`windows-latest`, `windows-11-arm`). Linux unit tests run on macOS and in the ubuntu CI job, which also builds both Linux architectures and checks `gofmt`. The Samba lab runs locally; it is not part of CI. Releases ship `thero-connect.exe` (amd64), `thero-connect-arm64.exe` (arm64 Windows Server and Windows on ARM), `thero-connect-linux-amd64` and `thero-connect-linux-arm64`, each with a `.sha256` file.
+Portable logic in `core` runs on macOS and Linux through `fakeSource`. Windows code is vetted and built with `GOOS=windows` for amd64 and arm64, and its tests run on the Windows CI jobs (`windows-latest`, `windows-11-arm`). The `windows-dfs` job installs the DFS Namespaces feature on `windows-latest`, creates a standalone namespace with two links and runs `go test -tags dfs -run Dfs ./windows`. Linux unit tests run on macOS and in the ubuntu CI job, which also builds both Linux architectures and checks `gofmt`. The Samba lab runs locally; it is not part of CI. Releases ship `thero-connect.exe` (amd64), `thero-connect-arm64.exe` (arm64 Windows Server and Windows on ARM), `thero-connect-linux-amd64` and `thero-connect-linux-arm64`, each with a `.sha256` file.
 
 ## Domain checklists
 
@@ -108,6 +111,14 @@ Windows client:
 - `enroll` refuses a folder created by a non-administrator.
 - The service starts under the gMSA.
 - Reading the descriptor (READ_CONTROL) works while a file is held open with deny-all sharing.
+
+DFS namespaces, with both clients:
+
+- The readers of every file in a namespace equal a real SMB open of the same file on its physical target, never the union of two targets.
+- Two links to the same share index it once, and the same link wins on every walk.
+- A link whose targets are all down is reported incomplete, and its records keep no readers.
+- A domain based root walks, and the client never connects to the domain name itself.
+- With `DfsDnsConfig=1`, referrals carry fully qualified names; with `DfsDnsConfig=0`, links are reported incomplete.
 
 Linux client:
 
