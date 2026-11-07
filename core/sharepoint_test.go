@@ -652,7 +652,7 @@ func basicFarm(t *testing.T) (*farm, *fakeSource, *farmList) {
 }
 
 func TestClaims(t *testing.T) {
-	person := Member{Login: `i:0#.w|corp\alice`, SID: "s-1-5-21-1-2-3-1001", SIDs: []string{"s-1-5-21-1-2-3-1001", "s-1-5-21-1-2-3-513", "s-1-5-21-1-2-3-2001"}}
+	person := Member{Login: `i:0#.w|corp\alice`, SID: "s-1-5-21-1-2-3-1001", SIDs: []string{"s-1-5-21-1-2-3-1001", "s-1-5-21-1-2-3-513", "s-1-5-21-1-2-3-2001", "s-1-5-32-545", "s-1-5-21-9-9-9-2001"}}
 	u := siteUser{ID: 11, Login: `i:0#.w|corp\alice`, SID: "s-1-5-21-1-2-3-1001"}
 	cases := []struct {
 		id    int64
@@ -677,6 +677,7 @@ func TestClaims(t *testing.T) {
 		{5, "i:0#.f|membership|alice", 1, false},
 		{5, "c:0-.f|rolemanager|staff", 4, false},
 		{5, "c:0+.w|s-1-5-32-545", 4, false},
+		{5, "c:0+.w|s-1-5-21-9-9-9-2001", 4, false},
 		{5, "c:0+.w|s-1-5-21-1-2-3-2001", 2, false},
 		{5, "", 4, false},
 	}
@@ -1755,6 +1756,11 @@ func TestRequestRules(t *testing.T) {
 	previous := retryPause
 	retryPause = func(_ context.Context, wait time.Duration) error { waits = append(waits, wait); return nil }
 	t.Cleanup(func() { retryPause = previous })
+	for _, client := range []*http.Client{a.sites.client, a.sites.stream} {
+		if client.Transport.(*http.Transport).Proxy != nil || client.CheckRedirect == nil || client.Jar != nil {
+			t.Fatal("site client uses a proxy, follows redirects or keeps cookies")
+		}
+	}
 	get := func() error {
 		return a.sites.get(context.Background(), r, http.MethodGet, "/sites/hr/_api/web?$select=Id", nil, &struct{}{})
 	}

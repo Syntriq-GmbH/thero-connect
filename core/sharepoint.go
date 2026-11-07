@@ -1372,8 +1372,11 @@ func (g *scopeGrants) mask(person Member, u siteUser) uint64 {
 		return fullMask
 	}
 	mask := g.base | g.users[u.ID]
+	domain := person.SID[:max(strings.LastIndex(person.SID, "-"), 0)]
 	for _, sid := range person.SIDs {
-		mask |= g.sids[sid]
+		if InDomain(sid, domain) {
+			mask |= g.sids[sid]
+		}
 	}
 	return mask
 }
