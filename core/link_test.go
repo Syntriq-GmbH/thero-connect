@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"bytes"
@@ -14,12 +14,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"maps"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -29,6 +31,39 @@ import (
 	"github.com/coder/websocket"
 )
 
+func TestMain(m *testing.M) {
+	plain := func(data []byte) ([]byte, error) { return data, nil }
+	host = Platform{Protect: plain, Unprotect: plain}
+	os.Exit(m.Run())
+}
+
+func TestLoadConfigServers(t *testing.T) {
+	load := func(roots string) (config, error) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("principal: thero-connect@CORP.EXAMPLE\nroots:\n"+roots), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return loadConfig(dir)
+	}
+	cfg, err := load("  - id: a\n    path: \\\\FS01.corp.example\\a\n  - id: b\n    path: \\\\Files.Corp.Example\\b\n    server: samba\n  - id: c\n    path: \\\\files.corp.example\\c\n    server: samba\n  - id: d\n    path: \\\\fs02.corp.example\\d\n    server: windows\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Principal != "thero-connect@CORP.EXAMPLE" || !maps.Equal(cfg.samba, map[string]bool{"files.corp.example": true}) {
+		t.Fatalf("principal %q, samba %v", cfg.Principal, cfg.samba)
+	}
+	refused := map[string]string{
+		"unknown value":       "  - id: a\n    path: \\\\fs01.corp.example\\a\n    server: linux\n",
+		"mixed host":          "  - id: a\n    path: \\\\fs01.corp.example\\a\n    server: samba\n  - id: b\n    path: \\\\FS01.corp.example\\b\n",
+		"mixed host explicit": "  - id: a\n    path: \\\\fs01.corp.example\\a\n    server: windows\n  - id: b\n    path: \\\\fs01.corp.example\\b\n    server: samba\n",
+	}
+	for name, roots := range refused {
+		if _, err := load(roots); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
 type fakeFile struct {
 	data     []byte
 	id       uint64
@@ -36,17 +71,19 @@ type fakeFile struct {
 	changed  time.Time
 	sd       []byte
 	touch    bool
+	handle   uint64
 }
 
 type fakeSource struct {
 	mu              sync.Mutex
 	files           map[string]*fakeFile
 	shares          map[string][]byte
-	accountList     []account
+	accountList     []Account
 	failures        map[string]error
 	descriptorCalls int
 	filters         []string
 	authzCalls      [][]string
+	tokens          map[string]Token
 }
 
 func newFakeSource() *fakeSource {
@@ -61,14 +98,14 @@ func (s *fakeSource) add(unc, content string, sd []byte) *fakeFile {
 	return f
 }
 
-func (s *fakeSource) list(dir string) ([]entry, error) {
+func (s *fakeSource) List(dir string) ([]Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.failures["list:"+dir]; err != nil {
 		return nil, err
 	}
 	seen := map[string]bool{}
-	var entries []entry
+	var entries []Entry
 	for unc, f := range s.files {
 		rest, ok := strings.CutPrefix(unc, dir+`\`)
 		if !ok {
@@ -80,30 +117,33 @@ func (s *fakeSource) list(dir string) ([]entry, error) {
 		}
 		seen[name] = true
 		if nested {
-			entries = append(entries, entry{name: name, dir: true})
+			entries = append(entries, Entry{Name: name, Dir: true})
 			continue
 		}
-		entries = append(entries, entry{name: name, id: f.id, size: int64(len(f.data)), created: f.modified, modified: f.modified, changed: f.changed})
+		entries = append(entries, Entry{Name: name, ID: f.id, Size: int64(len(f.data)), Created: f.modified, Modified: f.modified, Changed: f.changed})
 	}
-	slices.SortFunc(entries, func(a, b entry) int { return strings.Compare(a.name, b.name) })
+	slices.SortFunc(entries, func(a, b Entry) int { return strings.Compare(a.Name, b.Name) })
 	return entries, nil
 }
 
-func (s *fakeSource) descriptor(unc string) ([]byte, error) {
+func (s *fakeSource) Descriptor(unc string) ([]byte, uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.descriptorCalls++
 	if err := s.failures["descriptor:"+unc]; err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	f := s.files[unc]
 	if f == nil {
-		return nil, errNotFound
+		return nil, 0, ErrNotFound
 	}
-	return f.sd, nil
+	if f.handle != 0 {
+		return f.sd, f.handle, nil
+	}
+	return f.sd, f.id, nil
 }
 
-func (s *fakeSource) share(rootPath string) ([]byte, error) {
+func (s *fakeSource) Share(rootPath string) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.failures["share:"+rootPath]; err != nil {
@@ -115,7 +155,7 @@ func (s *fakeSource) share(rootPath string) ([]byte, error) {
 	return readable("S-1-1-0"), nil
 }
 
-func (s *fakeSource) accounts(filter string) ([]account, error) {
+func (s *fakeSource) Accounts(filter string) ([]Account, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.filters = append(s.filters, filter)
@@ -123,9 +163,9 @@ func (s *fakeSource) accounts(filter string) ([]account, error) {
 		return nil, err
 	}
 	filter = strings.ToLower(filter)
-	var found []account
+	var found []Account
 	for _, candidate := range s.accountList {
-		values := append([]string{candidate.mail, candidate.upn}, candidate.proxies...)
+		values := append([]string{candidate.Mail, candidate.UPN}, candidate.Proxies...)
 		for _, value := range values {
 			if value != "" && strings.Contains(filter, "="+strings.ToLower(value)+")") {
 				found = append(found, candidate)
@@ -136,7 +176,7 @@ func (s *fakeSource) accounts(filter string) ([]account, error) {
 	return found, nil
 }
 
-func (s *fakeSource) allowed(server string, sids []string, descriptors [][]byte) ([][]bool, error) {
+func (s *fakeSource) Allowed(server string, sids []string, descriptors [][]byte) ([][]bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.authzCalls = append(s.authzCalls, append([]string{server}, sids...))
@@ -147,6 +187,12 @@ func (s *fakeSource) allowed(server string, sids []string, descriptors [][]byte)
 	for k, sid := range sids {
 		matrix[k] = make([]bool, len(descriptors))
 		if s.failures["user:"+sid] != nil {
+			continue
+		}
+		if token, ok := s.tokens[sid]; ok {
+			for j, sd := range descriptors {
+				matrix[k][j] = Grants(token, sd)
+			}
 			continue
 		}
 		for j, sd := range descriptors {
@@ -165,7 +211,7 @@ func (s *fakeSource) allowed(server string, sids []string, descriptors [][]byte)
 	return matrix, nil
 }
 
-func (s *fakeSource) open(rootPath, rel string) (file, error) {
+func (s *fakeSource) Open(rootPath, rel string) (File, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	unc := rootPath + `\` + rel
@@ -174,7 +220,7 @@ func (s *fakeSource) open(rootPath, rel string) (file, error) {
 	}
 	f := s.files[unc]
 	if f == nil {
-		return nil, errNotFound
+		return nil, ErrNotFound
 	}
 	return &fakeHandle{src: s, f: f}, nil
 }
@@ -197,10 +243,10 @@ func (h *fakeHandle) Close() error {
 	return nil
 }
 
-func (h *fakeHandle) info() (fileInfo, error) {
+func (h *fakeHandle) Info() (FileInfo, error) {
 	h.src.mu.Lock()
 	defer h.src.mu.Unlock()
-	return fileInfo{id: h.f.id, size: int64(len(h.f.data)), modified: h.f.modified}, nil
+	return FileInfo{ID: h.f.id, Size: int64(len(h.f.data)), Modified: h.f.modified}, nil
 }
 
 type testCA struct {
@@ -284,7 +330,7 @@ func enrollHandler(t *testing.T, ca testCA, machine string, validity time.Durati
 		json.Unmarshal(data, &request)
 		block, _ := pem.Decode([]byte(request.CSR))
 		csr, err := x509.ParseCertificateRequest(block.Bytes)
-		if err != nil || request.Type != "enroll" || request.Version != 1 || request.Token != "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE" {
+		if err != nil || request.Type != "enroll" || request.Version != 1 || request.Client != version+" "+runtime.GOOS+"/"+runtime.GOARCH || request.Token != "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE" {
 			reply, _ := json.Marshal(failure(0, "enroll", "token unknown"))
 			conn.Write(r.Context(), websocket.MessageText, reply)
 			return
@@ -296,7 +342,7 @@ func enrollHandler(t *testing.T, ca testCA, machine string, validity time.Durati
 	}
 }
 
-func enrolledAgent(t *testing.T, ca testCA, link string, cfg config, src source, validity time.Duration) *agent {
+func enrolledAgent(t *testing.T, ca testCA, link string, cfg config, src Source, validity time.Duration) *agent {
 	dir := t.TempDir()
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	cert, certPEM := ca.issue(t, "9f1c2d3e4b5a69788796a5b4c3d2e1f0", &key.PublicKey, validity, x509.ExtKeyUsageClientAuth)
@@ -368,7 +414,7 @@ type linkTest struct {
 	sessions chan websocket.StatusCode
 }
 
-func startLink(t *testing.T, src source, validity time.Duration) *linkTest {
+func startLink(t *testing.T, src Source, validity time.Duration) *linkTest {
 	ca := newCA(t)
 	accepted := make(chan *linkTest, 1)
 	release := make(chan struct{})
@@ -396,7 +442,7 @@ func (lt *linkTest) connect(t *testing.T) {
 	}
 	var hello helloMessage
 	json.Unmarshal(next(t, lt.frames).data, &hello)
-	if hello.Type != "hello" || hello.Version != 1 || hello.Client != version || !slices.Equal(hello.Roots, []string{"finance", "hr"}) {
+	if hello.Type != "hello" || hello.Version != 1 || hello.Client != version+" "+runtime.GOOS+"/"+runtime.GOARCH || !slices.Equal(hello.Roots, []string{"finance", "hr"}) {
 		t.Fatalf("unexpected hello %+v", hello)
 	}
 	sendJSON(t, lt.conn, message{Type: "welcome"})
@@ -468,7 +514,7 @@ func TestHelloAndWelcome(t *testing.T) {
 func TestRequestsAnswered(t *testing.T) {
 	src := newFakeSource()
 	src.add(`\\fs01\finance\Reports\q1.pdf`, "q1", readable("S-1-5-21-1-2-3-1104"))
-	src.accountList = []account{{sid: "S-1-5-21-1-2-3-1104", guid: "6f1c2b3a-4d5e-4f60-8172-93a4b5c6d7e8", mail: "alice@example.com", enabled: true}}
+	src.accountList = []Account{{SID: "S-1-5-21-1-2-3-1104", GUID: "6f1c2b3a-4d5e-4f60-8172-93a4b5c6d7e8", Mail: "alice@example.com", Enabled: true}}
 	lt := startLink(t, src, 30*24*time.Hour)
 	sendJSON(t, lt.conn, message{Type: "walk", ID: 1, Root: "finance"})
 	var page pageMessage

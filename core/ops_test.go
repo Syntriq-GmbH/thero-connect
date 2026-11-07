@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"context"
@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-func testAgent(t *testing.T, src source) *agent {
+func testAgent(t *testing.T, src Source) *agent {
 	cfg := config{
 		Roots: []root{
 			{ID: "finance", Path: `\\fs01\finance`, Exclude: []string{"~$*", "*.tmp", "Archive/Old"}},
@@ -129,7 +129,7 @@ func TestWalkReportsIncompleteDirectory(t *testing.T) {
 	src := newFakeSource()
 	src.add(`\\fs01\finance\a\x.txt`, "x", readable("S-1-1-0"))
 	src.add(`\\fs01\finance\b\y.txt`, "y", readable("S-1-1-0"))
-	src.failures[`list:\\fs01\finance\b`] = errDenied
+	src.failures[`list:\\fs01\finance\b`] = ErrDenied
 	page := testAgent(t, src).walk(message{Type: "walk", ID: 1, Root: "finance"}).(pageMessage)
 	if len(page.Entries) != 1 || page.Entries[0].Path != "a/x.txt" || !slices.Equal(page.Incomplete, []string{"b"}) || page.Cursor != "" {
 		t.Fatalf("page %+v", page)
@@ -138,12 +138,12 @@ func TestWalkReportsIncompleteDirectory(t *testing.T) {
 
 func TestWalkRootFailure(t *testing.T) {
 	src := newFakeSource()
-	src.failures[`list:\\fs01\finance`] = errDenied
+	src.failures[`list:\\fs01\finance`] = ErrDenied
 	a := testAgent(t, src)
 	if reply := a.walk(message{Type: "walk", ID: 1, Root: "finance"}); codeOfReply(reply) != "denied" {
 		t.Fatalf("root failure answered %+v", reply)
 	}
-	src.failures[`list:\\fs01\finance`] = errNotFound
+	src.failures[`list:\\fs01\finance`] = ErrNotFound
 	if reply := a.walk(message{Type: "walk", ID: 2, Root: "finance"}); codeOfReply(reply) != "not_found" {
 		t.Fatalf("missing root answered %+v", reply)
 	}
@@ -178,7 +178,7 @@ func TestWalkUnsupportedDescriptorHasNoClass(t *testing.T) {
 	src.add(`\\fs01\finance\good.txt`, "g", readable("S-1-5-21-1-2-3-1104"))
 	src.add(`\\fs01\finance\network.txt`, "n", descriptorBytes("S-1-5-32-544", aclBytes(aceBytes(1, 0, 0x1, "S-1-5-2"), aceBytes(0, 0, 0x1200a9, "S-1-1-0")), nil))
 	src.add(`\\fs01\finance\unreadable.txt`, "u", readable("S-1-1-0"))
-	src.failures[`descriptor:\\fs01\finance\unreadable.txt`] = errDenied
+	src.failures[`descriptor:\\fs01\finance\unreadable.txt`] = ErrDenied
 	a := testAgent(t, src)
 	entries := walkAll(t, a, "finance")
 	if len(entries) != 3 || entries[0].Class == nil || entries[1].Class != nil || entries[2].Class != nil {
@@ -190,6 +190,21 @@ func TestWalkUnsupportedDescriptorHasNoClass(t *testing.T) {
 	data, _ := json.Marshal(entries[1])
 	if !strings.Contains(string(data), `"class":null`) {
 		t.Fatalf("encoded %s", data)
+	}
+}
+
+func TestWalkDescriptorOfAnotherFileHasNoClass(t *testing.T) {
+	src := newFakeSource()
+	src.add(`\\fs01\finance\a.txt`, "a", readable("S-1-5-21-1-2-3-1104"))
+	swapped := src.add(`\\fs01\finance\b.txt`, "b", readable("S-1-5-21-1-2-3-1105"))
+	swapped.handle = 99
+	a := testAgent(t, src)
+	entries := walkAll(t, a, "finance")
+	if len(entries) != 2 || entries[0].Class == nil || entries[1].Class != nil {
+		t.Fatalf("entries %+v", entries)
+	}
+	if len(a.classes) != 1 {
+		t.Fatalf("registry %v", a.classes)
 	}
 }
 
@@ -259,9 +274,9 @@ func TestLoadDropsForeignClassEntries(t *testing.T) {
 
 func TestPrincipalsBatchesAndAmbiguity(t *testing.T) {
 	src := newFakeSource()
-	src.accountList = []account{
-		{sid: "S-1-5-21-1-1", guid: "a", mail: "user0@example.com", proxies: []string{"user119@example.com"}, enabled: true},
-		{sid: "S-1-5-21-1-2", guid: "b", upn: "user50@example.com", enabled: true},
+	src.accountList = []Account{
+		{SID: "S-1-5-21-1-1", GUID: "a", Mail: "user0@example.com", Proxies: []string{"user119@example.com"}, Enabled: true},
+		{SID: "S-1-5-21-1-2", GUID: "b", UPN: "user50@example.com", Enabled: true},
 	}
 	var emails []string
 	for i := range 120 {
@@ -280,7 +295,7 @@ func TestPrincipalsBatchesAndAmbiguity(t *testing.T) {
 	if fmt.Sprint(got) != fmt.Sprint(map[string]bool{"user0@example.com": true, "user119@example.com": true, "user50@example.com": false}) {
 		t.Fatalf("users %v", got)
 	}
-	src.failures["accounts"] = fmt.Errorf("ldap: %w", errUnavailable)
+	src.failures["accounts"] = fmt.Errorf("ldap: %w", ErrUnavailable)
 	if reply := a.principals(message{Type: "principals", ID: 3, Emails: emails}); codeOfReply(reply) != "unavailable" {
 		t.Fatalf("directory failure answered %+v", reply)
 	}
@@ -290,10 +305,10 @@ func TestAccessReadersAndRootErrors(t *testing.T) {
 	alice, bob, carol, dave := "S-1-5-21-1-2-3-1104", "S-1-5-21-1-2-3-1105", "S-1-5-21-1-2-3-1106", "S-1-5-21-1-2-3-1107"
 	src := newFakeSource()
 	src.shares[`\\fs01\finance`] = readable(alice, bob, dave)
-	src.failures["user:"+dave] = errUnavailable
-	src.failures[`share:\\fs01\hr`] = errDenied
+	src.failures["user:"+dave] = ErrUnavailable
+	src.failures[`share:\\fs01\hr`] = ErrDenied
 	src.shares[`\\fs02\legal`] = descriptorBytes("S-1-5-32-544", aclBytes(aceBytes(1, 0, 0x1, "S-1-5-2"), aceBytes(0, 0, 0x1200a9, "S-1-1-0")), nil)
-	src.failures["allowed:fs03"] = errUnavailable
+	src.failures["allowed:fs03"] = ErrUnavailable
 	a := testAgent(t, src)
 	a.cfg.Roots = []root{{ID: "finance", Path: `\\fs01\finance`}, {ID: "hr", Path: `\\fs01\hr`}, {ID: "legal", Path: `\\fs02\legal`}, {ID: "ops", Path: `\\fs03\ops`}}
 	for _, r := range a.cfg.Roots {
@@ -328,6 +343,40 @@ func TestAccessReadersAndRootErrors(t *testing.T) {
 	}
 }
 
+func TestAccessShareOwnerRights(t *testing.T) {
+	admin := "S-1-5-21-1-2-3-500"
+	src := newFakeSource()
+	src.tokens = map[string]Token{admin: {Sure: map[string]bool{admin: true, "S-1-5-32-544": true, "S-1-1-0": true}}}
+	src.shares[`\\fs01\finance`] = descriptorBytes("S-1-5-32-544", aclBytes(aceBytes(0, 0, 0x1200a9, "S-1-3-4")), nil)
+	src.shares[`\\files\projects`] = descriptorBytes("S-1-5-32-544", aclBytes(aceBytes(0, 0x0b, 0x1200a9, "S-1-3-4"), aceBytes(0, 0, 0x1200a9, "S-1-1-0")), nil)
+	a := testAgent(t, src)
+	a.cfg.Roots = []root{{ID: "finance", Path: `\\fs01\finance`}, {ID: "projects", Path: `\\files\projects`, Server: "samba"}, {ID: "legal", Path: `\\fs02\legal`}}
+	a.cfg.samba = map[string]bool{"files": true}
+	finance := classOf("finance", readable("S-1-1-0"))
+	projects := classOf("projects", readable("S-1-1-0"))
+	a.classes[finance] = classEntry{Root: "finance", SD: readable("S-1-1-0")}
+	a.classes[projects] = classEntry{Root: "projects", SD: readable("S-1-1-0")}
+	legal := classOf("legal", readable("S-1-1-0"))
+	a.classes[legal] = classEntry{Root: "legal", SD: readable("S-1-1-0")}
+	for _, r := range a.cfg.Roots {
+		a.walked[r.ID] = a.now()
+	}
+	if !Grants(src.tokens[admin], src.shares[`\\fs01\finance`]) {
+		t.Fatal("the share descriptor alone would grant the administrator")
+	}
+	rights := a.access(message{Type: "access", ID: 4, SIDs: []string{admin}}).(rightsMessage)
+	readers := map[string][]int{}
+	for _, c := range rights.Classes {
+		readers[c.Class] = c.Readers
+	}
+	if len(rights.Errors) != 0 || len(readers[finance]) != 0 || !slices.Equal(readers[projects], []int{0}) || !slices.Equal(readers[legal], []int{0}) {
+		t.Fatalf("readers %v, errors %v", readers, rights.Errors)
+	}
+	if fmt.Sprint(src.authzCalls) != fmt.Sprint([][]string{{"files", admin}, {"files", admin}, {"fs02", admin}, {"fs02", admin}}) {
+		t.Fatalf("authz calls %v", src.authzCalls)
+	}
+}
+
 func TestAccessNeedsFreshWalk(t *testing.T) {
 	bob := "S-1-5-21-1-2-3-1105"
 	src := newFakeSource()
@@ -350,7 +399,7 @@ func TestAccessNeedsFreshWalk(t *testing.T) {
 	if classes, _ := readersOf(restarted); len(classes) != 1 || len(classes[0].Readers) != 1 {
 		t.Fatalf("after a restart %v", classes)
 	}
-	src.failures[`list:\\fs01\finance`] = errDenied
+	src.failures[`list:\\fs01\finance`] = ErrDenied
 	a.walk(message{Type: "walk", ID: 1, Root: "finance"})
 	if classes, errs := readersOf(a); len(classes) != 1 || len(classes[0].Readers) != 0 || errs != "[{finance unavailable}]" {
 		t.Fatalf("after a failed walk %v %s", classes, errs)

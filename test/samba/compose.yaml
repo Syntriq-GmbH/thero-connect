@@ -1,0 +1,115 @@
+name: ${THERO_SMB_PROJECT:-thero-smb}
+
+x-image: &image
+  dockerfile_inline: |
+    FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+    RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends samba samba-ad-dc samba-ad-provision winbind libnss-winbind krb5-user smbclient ldb-tools acl attr && rm -rf /var/lib/apt/lists/*
+
+networks:
+  thero-smb:
+    name: ${THERO_SMB_PROJECT:-thero-smb}
+    ipam:
+      config:
+        - subnet: ${THERO_SMB_NET:-172.30.53}.0/24
+
+volumes:
+  dc1-etc:
+  dc1-lib:
+  dc1-srv:
+  fs1-lib:
+  fs1-srv:
+
+configs:
+  fs1-smb:
+    content: |
+      [global]
+       workgroup = SAMDOM
+       realm = SAMDOM.EXAMPLE.COM
+       netbios name = FS1
+       security = ads
+       idmap config * : backend = tdb
+       idmap config * : range = 3000-7999
+       idmap config SAMDOM : backend = rid
+       idmap config SAMDOM : range = ${IDMAP_RANGE:-10000-999999}
+       vfs objects = acl_xattr
+       acl_xattr:ignore system acls = yes
+       acl_xattr:default acl style = windows
+       follow symlinks = no
+       load printers = no
+       disable spoolss = yes
+      [docs]
+       path = /srv/docs
+       read only = no
+      [restricted]
+       path = /srv/restricted
+       read only = no
+      [ownerrights]
+       path = /srv/ownerrights
+       read only = no
+  fs1-krb5:
+    content: |
+      [libdefaults]
+       default_realm = SAMDOM.EXAMPLE.COM
+       dns_lookup_kdc = true
+       dns_lookup_realm = false
+
+services:
+  dc1:
+    build: *image
+    image: thero-smb-samba
+    hostname: dc1
+    domainname: samdom.example.com
+    cap_add: [SYS_ADMIN]
+    environment:
+      ADMIN_PASS: Adm1n#Thero2026
+    networks:
+      thero-smb:
+        ipv4_address: ${THERO_SMB_NET:-172.30.53}.10
+    volumes:
+      - dc1-etc:/etc/samba
+      - dc1-lib:/var/lib/samba
+      - dc1-srv:/srv
+    command:
+      - bash
+      - -ec
+      - |
+        if [ ! -f /var/lib/samba/private/sam.ldb ]; then
+          rm -f /etc/samba/smb.conf
+          samba-tool domain provision --server-role=dc --realm=SAMDOM.EXAMPLE.COM --domain=SAMDOM --adminpass="$$ADMIN_PASS" --dns-backend=SAMBA_INTERNAL --host-ip=${THERO_SMB_NET:-172.30.53}.10 --option="dns forwarder = 127.0.0.11" --option="ldap server require strong auth = yes"
+        fi
+        cp /var/lib/samba/private/krb5.conf /etc/krb5.conf
+        echo "search samdom.example.com" > /etc/resolv.conf
+        echo "nameserver 127.0.0.1" >> /etc/resolv.conf
+        exec samba --foreground --no-process-group
+
+  fs1:
+    image: thero-smb-samba
+    pull_policy: never
+    depends_on: [dc1]
+    hostname: fs1
+    domainname: samdom.example.com
+    cap_add: [SYS_ADMIN]
+    dns: ["${THERO_SMB_NET:-172.30.53}.10"]
+    dns_search: [samdom.example.com]
+    environment:
+      ADMIN_PASS: Adm1n#Thero2026
+    networks:
+      thero-smb:
+        ipv4_address: ${THERO_SMB_NET:-172.30.53}.20
+    volumes:
+      - fs1-lib:/var/lib/samba
+      - fs1-srv:/srv
+    configs:
+      - source: fs1-smb
+        target: /etc/samba/smb.conf
+      - source: fs1-krb5
+        target: /etc/krb5.conf
+    command:
+      - bash
+      - -ec
+      - |
+        mkdir -p /srv/docs /srv/restricted /srv/ownerrights
+        chmod 0755 /srv /srv/docs /srv/restricted /srv/ownerrights
+        until net ads join -U "administrator%$$ADMIN_PASS" dnshostname=fs1.samdom.example.com; do sleep 2; done
+        winbindd --foreground --no-process-group &
+        exec smbd --foreground --no-process-group

@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"crypto/sha256"
@@ -7,58 +7,65 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 )
 
-type entry struct {
-	name     string
-	dir      bool
-	id       uint64
-	size     int64
-	created  time.Time
-	modified time.Time
-	changed  time.Time
+type Entry struct {
+	Name     string
+	Dir      bool
+	ID       uint64
+	Size     int64
+	Created  time.Time
+	Modified time.Time
+	Changed  time.Time
 }
 
-type account struct {
-	sid     string
-	guid    string
-	upn     string
-	mail    string
-	proxies []string
-	enabled bool
+type Account struct {
+	SID     string
+	GUID    string
+	UPN     string
+	Mail    string
+	Proxies []string
+	Enabled bool
 }
 
-type fileInfo struct {
-	id       uint64
-	size     int64
-	modified time.Time
+type FileInfo struct {
+	ID       uint64
+	Size     int64
+	Modified time.Time
 }
 
-type file interface {
+type File interface {
 	io.ReaderAt
 	io.Closer
-	info() (fileInfo, error)
+	Info() (FileInfo, error)
 }
 
-type source interface {
-	list(dir string) ([]entry, error)
-	descriptor(path string) ([]byte, error)
-	share(root string) ([]byte, error)
-	accounts(filter string) ([]account, error)
-	allowed(server string, sids []string, descriptors [][]byte) ([][]bool, error)
-	open(root, rel string) (file, error)
+type Source interface {
+	List(dir string) ([]Entry, error)
+	Descriptor(path string) ([]byte, uint64, error)
+	Share(root string) ([]byte, error)
+	Accounts(filter string) ([]Account, error)
+	Allowed(server string, sids []string, descriptors [][]byte) ([][]bool, error)
+	Open(root, rel string) (File, error)
+}
+
+type Token struct {
+	Sure   map[string]bool
+	Absent map[string]bool
 }
 
 var (
-	errDenied      = errors.New("denied")
-	errNotFound    = errors.New("not found")
-	errBusy        = errors.New("busy")
-	errUnavailable = errors.New("unavailable")
+	ErrDenied      = errors.New("denied")
+	ErrNotFound    = errors.New("not found")
+	ErrBusy        = errors.New("busy")
+	ErrUnavailable = errors.New("unavailable")
 )
 
 var deviceNames = map[string]bool{
@@ -95,7 +102,7 @@ func validPath(rel string) (string, error) {
 	return strings.Join(segments, `\`), nil
 }
 
-func splitUNC(unc string) (string, string, error) {
+func SplitUNC(unc string) (string, string, error) {
 	rest, ok := strings.CutPrefix(unc, `\\`)
 	if !ok {
 		return "", "", fmt.Errorf("%q is not a UNC path", unc)
@@ -124,7 +131,7 @@ func excluded(patterns []string, rel string) bool {
 	return false
 }
 
-func sidString(b []byte) (string, int, error) {
+func SIDString(b []byte) (string, int, error) {
 	if len(b) < 8 || b[0] != 1 || b[1] > 15 {
 		return "", 0, errors.New("invalid sid")
 	}
@@ -141,6 +148,47 @@ func sidString(b []byte) (string, int, error) {
 		sid += "-" + strconv.FormatUint(uint64(binary.LittleEndian.Uint32(b[i:])), 10)
 	}
 	return sid, size, nil
+}
+
+func Filetime(value int64) time.Time {
+	since := value - 116444736000000000
+	return time.Unix(since/10000000, since%10000000*100)
+}
+
+var AccountAttributes = []string{"objectSid", "objectGUID", "userPrincipalName", "mail", "proxyAddresses", "userAccountControl", "accountExpires"}
+
+func AccountOf(values map[string][][]byte, now time.Time) (Account, bool) {
+	first := func(name string) string {
+		if list := values[name]; len(list) > 0 {
+			return string(list[0])
+		}
+		return ""
+	}
+	sid, _, err := SIDString([]byte(first("objectSid")))
+	guid := []byte(first("objectGUID"))
+	if err != nil || len(guid) != 16 {
+		return Account{}, false
+	}
+	var proxies []string
+	for _, proxy := range values["proxyAddresses"] {
+		if len(proxy) > 5 && strings.EqualFold(string(proxy[:5]), "smtp:") {
+			proxies = append(proxies, strings.ToLower(string(proxy[5:])))
+		}
+	}
+	control, err := strconv.ParseUint(first("userAccountControl"), 10, 32)
+	enabled := err == nil && control&2 == 0
+	if value := first("accountExpires"); value != "" {
+		expires, err := strconv.ParseInt(value, 10, 64)
+		enabled = enabled && err == nil && (expires == 0 || expires == math.MaxInt64 || expires > now.UnixNano()/100+116444736000000000)
+	}
+	return Account{
+		SID:     sid,
+		GUID:    fmt.Sprintf("%08x-%04x-%04x-%x-%x", binary.LittleEndian.Uint32(guid[0:4]), binary.LittleEndian.Uint16(guid[4:6]), binary.LittleEndian.Uint16(guid[6:8]), guid[8:10], guid[10:16]),
+		UPN:     first("userPrincipalName"),
+		Mail:    first("mail"),
+		Proxies: proxies,
+		Enabled: enabled,
+	}, true
 }
 
 type ace struct {
@@ -179,7 +227,7 @@ func readACL(sd []byte, offset uint32) ([]ace, []byte, error) {
 			if len(raw) < 8 {
 				return nil, nil, errors.New("truncated ace")
 			}
-			sid, _, err := sidString(raw[8:])
+			sid, _, err := SIDString(raw[8:])
 			if err != nil {
 				return nil, nil, err
 			}
@@ -260,13 +308,63 @@ func classOf(root string, sd []byte) string {
 		hash.Write([]byte{0})
 		ownerOffset := int(binary.LittleEndian.Uint32(sd[4:]))
 		if ownerOffset > 0 && ownerOffset < len(sd) {
-			if _, size, err := sidString(sd[ownerOffset:]); err == nil {
+			if _, size, err := SIDString(sd[ownerOffset:]); err == nil {
 				hash.Write(sd[ownerOffset : ownerOffset+size])
 			}
 		}
 		break
 	}
 	return hex.EncodeToString(hash.Sum(nil))[:32]
+}
+
+const readData = 0x1
+
+func Grants(t Token, sd []byte) bool {
+	if supported(sd) != nil {
+		return false
+	}
+	owner := ""
+	if offset := binary.LittleEndian.Uint32(sd[4:]); offset != 0 && int(offset) < len(sd) {
+		owner, _, _ = SIDString(sd[offset:])
+	}
+	dacl, _, err := readACL(sd, binary.LittleEndian.Uint32(sd[16:]))
+	if err != nil {
+		return false
+	}
+	granted := false
+	for _, item := range dacl {
+		if item.flags&0x08 != 0 || item.mask&readData == 0 {
+			continue
+		}
+		if item.kind == 1 && !t.Absent[item.sid] {
+			return false
+		}
+		if item.kind == 0 && (t.Sure[item.sid] || item.sid == "S-1-3-4" && owner != "" && t.Sure[owner]) {
+			granted = true
+		}
+	}
+	return granted
+}
+
+func DeniedSIDs(descriptors [][]byte) []string {
+	unique := map[string]bool{}
+	for _, sd := range descriptors {
+		if supported(sd) != nil {
+			continue
+		}
+		dacl, _, _ := readACL(sd, binary.LittleEndian.Uint32(sd[16:]))
+		for _, item := range dacl {
+			if item.kind == 1 && item.flags&0x08 == 0 {
+				unique[item.sid] = true
+			}
+		}
+	}
+	sids := make([]string, 0, len(unique))
+	for sid := range unique {
+		sids = append(sids, sid)
+	}
+	slices.Sort(sids)
+	return sids
 }
 
 func ldapFilter(emails []string) string {
@@ -281,16 +379,16 @@ func ldapFilter(emails []string) string {
 	return filter.String()
 }
 
-func matchAccounts(emails []string, accounts []account) []user {
+func matchAccounts(emails []string, accounts []Account) []user {
 	known := map[string]bool{}
-	byAddress := map[string][]account{}
+	byAddress := map[string][]Account{}
 	for _, candidate := range accounts {
-		if known[candidate.sid] {
+		if known[candidate.SID] {
 			continue
 		}
-		known[candidate.sid] = true
+		known[candidate.SID] = true
 		addresses := map[string]bool{}
-		for _, address := range append([]string{candidate.mail, candidate.upn}, candidate.proxies...) {
+		for _, address := range append([]string{candidate.Mail, candidate.UPN}, candidate.Proxies...) {
 			address = strings.ToLower(address)
 			if address != "" && !addresses[address] {
 				addresses[address] = true
@@ -304,9 +402,9 @@ func matchAccounts(emails []string, accounts []account) []user {
 	for _, email := range emails {
 		email = strings.ToLower(email)
 		for _, candidate := range byAddress[email] {
-			users = append(users, user{Email: email, SID: candidate.sid, GUID: candidate.guid, UPN: candidate.upn, Mail: candidate.mail, Enabled: candidate.enabled})
+			users = append(users, user{Email: email, SID: candidate.SID, GUID: candidate.GUID, UPN: candidate.UPN, Mail: candidate.Mail, Enabled: candidate.Enabled})
 			perEmail[email]++
-			perSID[candidate.sid]++
+			perSID[candidate.SID]++
 		}
 	}
 	for i := range users {
@@ -317,13 +415,13 @@ func matchAccounts(emails []string, accounts []account) []user {
 
 func codeOf(err error) string {
 	switch {
-	case errors.Is(err, errDenied):
+	case errors.Is(err, ErrDenied):
 		return "denied"
-	case errors.Is(err, errNotFound):
+	case errors.Is(err, ErrNotFound):
 		return "not_found"
-	case errors.Is(err, errBusy):
+	case errors.Is(err, ErrBusy):
 		return "busy"
-	case errors.Is(err, errUnavailable):
+	case errors.Is(err, ErrUnavailable):
 		return "unavailable"
 	}
 	return "failed"

@@ -1,10 +1,10 @@
 # AGENTS.md
 
-This file provides guidance to coding agents working in this repository.
+Guide for every contributor and coding agent in this repository. Its code doctrine, git rules and commands apply to every change.
 
 ## What this is
 
-Thero Connect: a small Windows service that runs in a customer network and lets Thero index on-premises SMB file shares without opening any inbound port. It connects outbound to Thero over WebSocket with mutual TLS and answers a narrow set of read requests. Thero never receives a route into the network or a password. The server side lives in the `thero-ai` repository (`backend/python/app/connectors/sources/smb_share/`).
+Thero Connect for file shares: small clients, one per platform (Windows, Linux) on a shared core, that run in a customer network and let Thero index on-premises SMB file shares without opening any inbound port. Each client connects outbound to Thero over WebSocket with mutual TLS and answers a narrow set of read requests. Thero never receives a route into the network or a password. The server side lives in the private `thero-ai` repository (`backend/python/app/connectors/sources/smb_share/`).
 
 ## Code doctrine: simple and minimal
 
@@ -18,7 +18,12 @@ Top priority for every change. It outranks elegance, extensibility and completen
 - **Add nothing that is not needed.** No extra configuration, no new package, no new dependency without a consumer in the same commit.
 - **Standard library first.** `CGO_ENABLED=0`; Windows APIs through `golang.org/x/sys/windows`.
 - **Fail closed.** When a permission, path or identity cannot be determined exactly, the client returns an error and grants nothing.
-- Windows API calls live only in `*_windows.go`; everything else stays testable behind `source`.
+- `core` imports no platform package and has no build-tagged file.
+- Every file in `windows/` starts with `//go:build windows`; `golang.org/x/sys/windows` appears only there.
+- Every file in `linux/` starts with `//go:build !windows` (`samba_test.go`: `//go:build samba`), not `linux`, so its pure tests run on macOS too; releases build it with `GOOS=linux` only. SMB, RPC, LDAP and systemd code appears only there.
+- The permission decision (`supported`, `classOf`, `Grants`, `DeniedSIDs`, the share-then-file order, the OWNER RIGHTS share refusal, the descriptor id check, the account-enabled rule in `AccountOf`) lives only in `core`. A platform folder only gathers facts (bytes, ids, tokens) or asks the file server.
+- The Linux client authenticates with Kerberos from its keytab only. No NTLM credential or mechanism is ever registered, and the global credential and mechanism stores of go-msrpc are never used.
+- Every bump of `go-smb2/v2`, `go-msrpc` or `go-smb2.fork` gets a diff review and the full Samba lab run before it merges.
 
 ## Git
 
@@ -30,38 +35,89 @@ Top priority for every change. It outranks elegance, extensibility and completen
 ## Commands
 
 ```bash
+gofmt -l .
 go vet ./...
 go test ./...
 GOOS=windows GOARCH=amd64 go vet ./...
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o thero-connect.exe .
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o thero-connect.exe ./windows
 GOOS=windows GOARCH=arm64 go vet ./...
-GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -o thero-connect-arm64.exe .
-go test -tags e2e -run TestE2E -count=1 -timeout 0 .
+GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -o thero-connect-arm64.exe ./windows
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o thero-connect-linux-amd64 ./linux
+GOOS=linux GOARCH=arm64 go vet ./...
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o thero-connect-linux-arm64 ./linux
+go vet -tags e2e ./...
+go vet -tags samba ./...
+SMB_E2E_URL=wss://<host> SMB_E2E_CA=<fingerprint> SMB_E2E_TOKEN=<token> go test -tags e2e -run TestE2E -count=1 -timeout 0 ./core
+test/samba/run.sh up && test/samba/run.sh fresh && test/samba/run.sh truth && test/samba/run.sh test && test/samba/run.sh idmap
+test/samba/run.sh down
 ```
+
+`TestE2E` enrolls against a running Thero server and keeps the link for `SMB_E2E_SECONDS` (default 900); without `SMB_E2E_URL` it skips. `run.sh idmap` leaves the file server with a cut idmap range; run `up` again before another `test`. One lab runs per Docker project: set `THERO_SMB_PROJECT` (default `thero-smb`) and `THERO_SMB_NET`, the first three octets of a free /24 (default `172.30.53`), to run a second lab or to avoid an overlapping network.
 
 ## Layout
 
-Everything is `package main` at the repository root.
+One module, a shared `core` package and one `package main` folder per platform.
 
-- `main.go`: command dispatch, flags, the `check` command, `config.yaml` loading and validation, state paths, atomic file writes, logger setup.
-- `link.go`: protocol structs, TLS, `enroll`, `serve` with the reconnect loop, one link session, certificate renewal.
-- `ops.go`: the handlers `walk`, `principals`, `access` and `read`, walk state, class registry (`classes.json`), last complete walk per root (`walks.json`), daily quota (`quota.json`), rate limiter, read window.
-- `source.go`: the `source` and `file` interfaces, portable types, sentinel errors and the pure helpers (paths, UNC, excludes, descriptors, classes, LDAP filter, account matching, error codes).
-- `source_windows.go`: `windowsSource`, the only real `source`.
-- `system_windows.go`: DPAPI, service, folder ACLs, install, uninstall, event log.
-- `system_other.go`: development stand-ins of the system functions for other platforms; never released.
-- `link_test.go`: `fakeSource` and in-process TLS link server tests.
-- `ops_test.go`: handler tests on `fakeSource`.
-- `source_test.go`: table tests of the pure helpers and security descriptor builders.
-- `source_windows_test.go`: struct layout and DLL export tests, run on the Windows CI job.
-- `protocol_test.go`: fixture round trip, protocol digest, chunk layout.
-- `e2e_test.go`: real enrollment and link against a running thero-ai (`-tags e2e`).
+- `core/main.go`: `Platform` (what a platform supplies), `Main`, command dispatch, flags, the `check` command, `config.yaml` loading and validation, state paths, atomic file writes, logger setup.
+- `core/link.go`: protocol structs, TLS, `enroll`, `serve` with the reconnect loop, one link session, certificate renewal.
+- `core/ops.go`: the handlers `walk`, `principals`, `access` and `read`, walk state, class registry (`classes.json`), last complete walk per root (`walks.json`), daily quota (`quota.json`), rate limiter, read window.
+- `core/source.go`: the `Source` and `File` interfaces, portable types, sentinel errors and the pure helpers (paths, UNC, SIDs, FILETIME, accounts from directory values, excludes, descriptors, classes, LDAP filter, account matching, error codes).
+- `core/link_test.go`: `TestMain` with a plain `Platform`, `fakeSource` and in-process TLS link server tests.
+- `core/ops_test.go`: handler tests on `fakeSource`.
+- `core/source_test.go`: table tests of the pure helpers, golden class ids and security descriptor builders.
+- `core/protocol_test.go`: fixture round trip, protocol digest, chunk layout.
+- `core/e2e_test.go`: real enrollment and link against a running Thero server (`-tags e2e`).
+- `windows/main.go`: `main`, DPAPI, service, folder ACLs, install, uninstall, event log.
+- `windows/source.go`: `windowsSource`, the Windows `Source`.
+- `windows/source_test.go`: struct layout, DLL export and share tests, run on the Windows CI jobs.
+- `windows/README.md`: Windows requirements, rights, install, operations.
+- `linux/main.go`: `main`, folder ownership and modes, install, uninstall, the systemd unit.
+- `linux/source.go`: the Linux `Source`: Kerberos login, SMB file plane, share descriptors over srvsvc, MS-RAA for Windows file servers, the token and `core.Grants` for Samba file servers.
+- `linux/directory.go`: domain controller lookup, LDAP with a sealed GSSAPI bind, accounts, own SID and token facts.
+- `linux/main_test.go`, `linux/source_test.go`: unit tests that run on macOS and Linux.
+- `linux/samba_test.go`: access matrix against the Samba lab (`-tags samba`, driven by `test/samba/run.sh`).
+- `linux/README.md`: Linux requirements, keytab, rights, Samba prerequisites, install, operations, limits.
+- `test/samba/`: Samba Active Directory lab in Docker (`compose.yaml`, `run.sh`). Its passwords are lab values only.
 - `protocol/v1/`: the canonical protocol.
 
 ## Protocol
 
-`protocol/v1` (schema, fixtures, `chunk.bin`) is canonical. Change the schema, the fixtures, `protocolDigest` in `protocol_test.go` and the thero-ai copy `backend/python/tests/fixtures/smb_protocol_v1` with its `PROTOCOL_DIGEST` together. A breaking change creates `protocol/v2` and version 2.
+`protocol/v1` (schema, fixtures, `chunk.bin`) is canonical. Change the schema, the fixtures, `protocolDigest` in `core/protocol_test.go` and the server copy `backend/python/tests/fixtures/smb_protocol_v1` in `thero-ai` with its `PROTOCOL_DIGEST` together. A breaking change creates `protocol/v2` and version 2.
 
 ## Testing
 
-Portable logic runs on macOS and Linux through `fakeSource`. Windows code is vetted and built with `GOOS=windows` for amd64 and arm64, and its layout tests run on the Windows CI jobs. Releases ship `thero-connect.exe` (amd64) and `thero-connect-arm64.exe` (arm64 Windows Server and Windows on ARM). Behaviour against a real domain follows the checklist in the README.
+Portable logic in `core` runs on macOS and Linux through `fakeSource`. Windows code is vetted and built with `GOOS=windows` for amd64 and arm64, and its tests run on the Windows CI jobs (`windows-latest`, `windows-11-arm`). Linux unit tests run on macOS and in the ubuntu CI job, which also builds both Linux architectures and checks `gofmt`. The Samba lab runs locally; it is not part of CI. Releases ship `thero-connect.exe` (amd64), `thero-connect-arm64.exe` (arm64 Windows Server and Windows on ARM), `thero-connect-linux-amd64` and `thero-connect-linux-arm64`, each with a `.sha256` file.
+
+## Domain checklists
+
+Before the first rollout of a release on a real domain, check the following.
+
+Windows client:
+
+- Power Users can read share information level 502.
+- The remote access check result equals a real SMB open as Alice and as Bob for: share allow and deny, NTFS allow and deny order, inheritance, an empty DACL, nested groups, domain-local and server-local groups.
+- Unsupported ACEs and ACEs with generic access bits make a file `class: null`.
+- A deny ACE for "This Organization" and for "NTLM Authentication" gives `class: null`.
+- A user with `sIDHistory` is evaluated correctly.
+- A file with an allow ACE for INTERACTIVE gives `class: null`.
+- A share descriptor without owner is evaluated.
+- `SetSecurityInfo` on a file changes its change time as seen over SMB.
+- An expired account is reported disabled.
+- `LDAP_OPT_SIGN` and `LDAP_OPT_ENCRYPT` set to 1 work against the domain controllers.
+- After `enroll`, `icacls` shows only SYSTEM and Administrators on the folder and on `state`.
+- `enroll` refuses a folder created by a non-administrator.
+- The service starts under the gMSA.
+- Reading the descriptor (READ_CONTROL) works while a file is held open with deny-all sharing.
+
+Linux client:
+
+- The Windows checklist above passes with the Linux client.
+- With the Windows and the Linux client enrolled on the same connector and roots, every permission class has the same readers.
+- The LDAP bind works with "LDAP server signing requirements" set to "Require signing".
+- Walk and read work on a share that requires encryption with AES-256-GCM.
+- A Windows root configured with `server: samba` reports `unavailable` and no readers.
+- On a Samba root, the readers match a real SMB open as Alice and as Bob for: share allow and deny, file allow and deny, inheritance, nested groups, domain-local groups and a disabled user.
+- `enroll` refuses a folder that a non-root user created.
+- After `install`, `stat` shows the owners and modes from the table in `linux/README.md`, `systemd-analyze verify` passes and `systemd-analyze security thero-connect` shows an exposure of 3.0 or less with no UNSAFE line.
+- The service comes back 60 seconds after `kill -9`.
+- `journalctl -u thero-connect` contains no keytab, ticket, file content or token data.

@@ -1,10 +1,12 @@
-package main
+package core
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/url"
@@ -13,6 +15,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,15 +25,18 @@ import (
 var version = "dev"
 
 type config struct {
-	Proxy  string `yaml:"proxy"`
-	Roots  []root `yaml:"roots"`
-	Limits limits `yaml:"limits"`
+	Proxy     string `yaml:"proxy"`
+	Principal string `yaml:"principal"`
+	Roots     []root `yaml:"roots"`
+	Limits    limits `yaml:"limits"`
+	samba     map[string]bool
 }
 
 type root struct {
 	ID      string   `yaml:"id"`
 	Path    string   `yaml:"path"`
 	Exclude []string `yaml:"exclude"`
+	Server  string   `yaml:"server"`
 }
 
 type limits struct {
@@ -42,8 +48,23 @@ type limits struct {
 
 var rootPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
-func main() {
-	slog.SetDefault(slog.New(slog.NewTextHandler(logOutput(isService()), nil)))
+type Platform struct {
+	Dir        string
+	Source     func(dir, principal string, samba map[string]bool) (Source, error)
+	Protect    func([]byte) ([]byte, error)
+	Unprotect  func([]byte) ([]byte, error)
+	SecureDir  func(dir, account string) error
+	Install    func(dir, account string) error
+	Uninstall  func() error
+	RunService func(run func(context.Context) error) error
+	Log        io.Writer
+}
+
+var host Platform
+
+func Main(p Platform) {
+	host = p
+	slog.SetDefault(slog.New(slog.NewTextHandler(host.Log, nil)))
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: thero-connect enroll|run|install|uninstall|check [flags]")
 		os.Exit(2)
@@ -56,12 +77,12 @@ func main() {
 
 func command(name string, args []string) error {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
-	dir := flags.String("dir", filepath.Join(os.Getenv("ProgramData"), "Thero Connect"), "configuration folder")
+	dir := flags.String("dir", host.Dir, "configuration folder")
 	switch name {
 	case "enroll":
 		link := flags.String("url", "", "link address wss://host[:port]")
 		pin := flags.String("ca", "", "sha256 of the connect CA certificate")
-		token := flags.String("token", "", "one-time enrollment token")
+		token := flags.String("token", "", "one-time enrollment token, read from standard input when empty")
 		if err := flags.Parse(args); err != nil {
 			return err
 		}
@@ -69,8 +90,19 @@ func command(name string, args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := secureDir(*dir, ""); err != nil {
+		if err := host.SecureDir(*dir, ""); err != nil {
 			return err
+		}
+		if _, err := host.Source(*dir, cfg.Principal, cfg.samba); err != nil {
+			return err
+		}
+		if *token == "" {
+			fmt.Fprint(os.Stderr, "Enrollment token: ")
+			line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+			*token = strings.TrimSpace(line)
+		}
+		if *token == "" {
+			return errors.New("enter the enrollment token")
 		}
 		machine, err := enroll(context.Background(), *dir, cfg, *link, *pin, *token)
 		if err != nil {
@@ -86,12 +118,12 @@ func command(name string, args []string) error {
 		if err != nil {
 			return err
 		}
-		src, err := newSource()
+		src, err := host.Source(*dir, cfg.Principal, cfg.samba)
 		if err != nil {
 			return err
 		}
-		if isService() {
-			return runService(func(ctx context.Context) error { return serve(ctx, *dir, cfg, src) })
+		if host.RunService != nil {
+			return host.RunService(func(ctx context.Context) error { return serve(ctx, *dir, cfg, src) })
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
@@ -104,15 +136,19 @@ func command(name string, args []string) error {
 		if *account == "" {
 			return errors.New("-account is required")
 		}
-		if _, err := loadConfig(*dir); err != nil {
+		cfg, err := loadConfig(*dir)
+		if err != nil {
+			return err
+		}
+		if _, err := host.Source(*dir, cfg.Principal, cfg.samba); err != nil {
 			return err
 		}
 		if _, _, err := readIdentity(*dir); err != nil {
 			return err
 		}
-		return install(*dir, *account)
+		return host.Install(*dir, *account)
 	case "uninstall":
-		return uninstall()
+		return host.Uninstall()
 	case "check":
 		if err := flags.Parse(args); err != nil {
 			return err
@@ -145,20 +181,20 @@ func check(dir string) error {
 			report(fmt.Sprintf("certificate (%d days left)", days), nil)
 		}
 	}
-	src, err := newSource()
+	src, err := host.Source(dir, cfg.Principal, cfg.samba)
 	if report("source", err) {
 		for _, r := range cfg.Roots {
-			_, err := src.list(r.Path)
+			_, err := src.List(r.Path)
 			report("root "+r.ID+" list", err)
-			share, err := src.share(r.Path)
+			share, err := src.Share(r.Path)
 			if !report("root "+r.ID+" share", err) || !report("root "+r.ID+" share descriptor", supported(share)) {
 				continue
 			}
-			server, _, _ := splitUNC(r.Path)
-			_, err = src.allowed(server, nil, [][]byte{share})
+			server, _, _ := SplitUNC(r.Path)
+			_, err = src.Allowed(server, nil, [][]byte{share})
 			report("root "+r.ID+" authz", err)
 		}
-		_, err := src.accounts("(&(objectCategory=person)(objectClass=user)(mail=thero-connect-check@invalid))")
+		_, err := src.Accounts("(&(objectCategory=person)(objectClass=user)(mail=thero-connect-check@invalid))")
 		report("directory", err)
 	}
 	if configured && enrolled {
@@ -194,13 +230,31 @@ func loadConfig(dir string) (config, error) {
 		return config{}, errors.New("config.yaml: 1 to 64 roots required")
 	}
 	ids := map[string]bool{}
+	servers := map[string]string{}
+	cfg.samba = map[string]bool{}
 	for _, r := range cfg.Roots {
 		if !rootPattern.MatchString(r.ID) || ids[r.ID] {
 			return config{}, fmt.Errorf("config.yaml: invalid or duplicate root id %q", r.ID)
 		}
 		ids[r.ID] = true
-		if _, _, err := splitUNC(r.Path); err != nil {
+		server, _, err := SplitUNC(r.Path)
+		if err != nil {
 			return config{}, fmt.Errorf("config.yaml: root %s: %w", r.ID, err)
+		}
+		kind := r.Server
+		if kind == "" {
+			kind = "windows"
+		}
+		if kind != "windows" && kind != "samba" {
+			return config{}, fmt.Errorf("config.yaml: root %s: server must be windows or samba", r.ID)
+		}
+		server = strings.ToLower(server)
+		if known, ok := servers[server]; ok && known != kind {
+			return config{}, fmt.Errorf("config.yaml: root %s: host %s has roots with server windows and samba", r.ID, server)
+		}
+		servers[server] = kind
+		if kind == "samba" {
+			cfg.samba[server] = true
 		}
 		for _, pattern := range r.Exclude {
 			if _, err := path.Match(pattern, ""); err != nil {

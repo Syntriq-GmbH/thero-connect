@@ -1,21 +1,28 @@
+//go:build windows
+
 package main
 
 import (
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"math"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 	"unsafe"
 
+	"github.com/Syntriq-GmbH/thero-connect/core"
 	"golang.org/x/sys/windows"
 )
 
 type windowsSource struct{}
+
+func newSource(dir, principal string, samba map[string]bool) (core.Source, error) {
+	if principal != "" || len(samba) > 0 {
+		return nil, errors.New("principal and server: samba need the Linux client")
+	}
+	return windowsSource{}, nil
+}
 
 type windowsFile struct {
 	*os.File
@@ -118,11 +125,11 @@ var (
 func sentinel(err error) error {
 	switch {
 	case errors.Is(err, windows.ERROR_ACCESS_DENIED):
-		return errDenied
+		return core.ErrDenied
 	case errors.Is(err, windows.ERROR_FILE_NOT_FOUND), errors.Is(err, windows.ERROR_PATH_NOT_FOUND), errors.Is(err, windows.ERROR_BAD_NET_NAME):
-		return errNotFound
+		return core.ErrNotFound
 	case errors.Is(err, windows.ERROR_SHARING_VIOLATION), errors.Is(err, windows.ERROR_LOCK_VIOLATION):
-		return errBusy
+		return core.ErrBusy
 	}
 	return err
 }
@@ -130,9 +137,9 @@ func sentinel(err error) error {
 func authzFailure(server string, err error) error {
 	switch {
 	case errors.Is(err, windows.RPC_S_SERVER_UNAVAILABLE), errors.Is(err, windows.EPT_S_NOT_REGISTERED), errors.Is(err, windows.RPC_S_CALL_FAILED), errors.Is(err, windows.RPC_S_CALL_FAILED_DNE):
-		return fmt.Errorf("%w: authz %s: %v", errUnavailable, server, err)
+		return fmt.Errorf("%w: authz %s: %v", core.ErrUnavailable, server, err)
 	case errors.Is(err, windows.ERROR_ACCESS_DENIED):
-		return errDenied
+		return core.ErrDenied
 	}
 	return nil
 }
@@ -159,13 +166,13 @@ func attributesOf(handle windows.Handle) (uint32, error) {
 		return 0, sentinel(err)
 	}
 	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return 0, errDenied
+		return 0, core.ErrDenied
 	}
 	return info.FileAttributes, nil
 }
 
 func openInShare(path string, access, share, flags uint32, directory bool) (windows.Handle, error) {
-	server, name, err := splitUNC(path)
+	server, name, err := core.SplitUNC(path)
 	if err != nil {
 		return 0, err
 	}
@@ -187,7 +194,7 @@ func openInShare(path string, access, share, flags uint32, directory bool) (wind
 			return 0, err
 		}
 		if attributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
-			return 0, errNotFound
+			return 0, core.ErrNotFound
 		}
 		current += `\` + part
 	}
@@ -197,7 +204,7 @@ func openInShare(path string, access, share, flags uint32, directory bool) (wind
 	}
 	attributes, err := attributesOf(handle)
 	if err == nil && (attributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != directory {
-		err = errDenied
+		err = core.ErrDenied
 	}
 	if err != nil {
 		windows.CloseHandle(handle)
@@ -206,16 +213,11 @@ func openInShare(path string, access, share, flags uint32, directory bool) (wind
 	return handle, nil
 }
 
-func filetime(value int64) time.Time {
-	since := value - 116444736000000000
-	return time.Unix(since/10000000, since%10000000*100)
-}
-
 func securityBytes(sd *windows.SECURITY_DESCRIPTOR) []byte {
 	return bytes.Clone(unsafe.Slice((*byte)(unsafe.Pointer(sd)), sd.Length()))
 }
 
-func (windowsSource) list(dir string) ([]entry, error) {
+func (windowsSource) List(dir string) ([]core.Entry, error) {
 	handle, err := openInShare(dir, windows.FILE_LIST_DIRECTORY|windows.FILE_READ_ATTRIBUTES|windows.SYNCHRONIZE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, windows.FILE_FLAG_BACKUP_SEMANTICS, true)
 	if err != nil {
 		return nil, err
@@ -223,7 +225,7 @@ func (windowsSource) list(dir string) ([]entry, error) {
 	defer windows.CloseHandle(handle)
 	skipped := uint32(windows.FILE_ATTRIBUTE_REPARSE_POINT | windows.FILE_ATTRIBUTE_OFFLINE | windows.FILE_ATTRIBUTE_RECALL_ON_OPEN | windows.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
 	buffer := make([]uint64, 8192)
-	var entries []entry
+	var entries []core.Entry
 	for {
 		err := windows.GetFileInformationByHandleEx(handle, windows.FileIdBothDirectoryInfo, (*byte)(unsafe.Pointer(&buffer[0])), uint32(len(buffer)*8))
 		if errors.Is(err, windows.ERROR_NO_MORE_FILES) || errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
@@ -236,14 +238,14 @@ func (windowsSource) list(dir string) ([]entry, error) {
 			info := (*fileIDBothDirInfo)(unsafe.Add(unsafe.Pointer(&buffer[0]), offset))
 			name := windows.UTF16ToString(unsafe.Slice(&info.fileName[0], info.fileNameLength/2))
 			if name != "." && name != ".." && info.fileAttributes&skipped == 0 {
-				entries = append(entries, entry{
-					name:     name,
-					dir:      info.fileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0,
-					id:       uint64(info.fileID),
-					size:     info.endOfFile,
-					created:  filetime(info.creationTime),
-					modified: filetime(info.lastWriteTime),
-					changed:  filetime(info.changeTime),
+				entries = append(entries, core.Entry{
+					Name:     name,
+					Dir:      info.fileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0,
+					ID:       uint64(info.fileID),
+					Size:     info.endOfFile,
+					Created:  core.Filetime(info.creationTime),
+					Modified: core.Filetime(info.lastWriteTime),
+					Changed:  core.Filetime(info.changeTime),
 				})
 			}
 			if info.nextEntryOffset == 0 {
@@ -254,22 +256,26 @@ func (windowsSource) list(dir string) ([]entry, error) {
 	}
 }
 
-func (windowsSource) descriptor(path string) ([]byte, error) {
+func (windowsSource) Descriptor(path string) ([]byte, uint64, error) {
 	handle, err := openInShare(path, windows.READ_CONTROL|windows.FILE_READ_ATTRIBUTES, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, windows.FILE_FLAG_BACKUP_SEMANTICS, false)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer windows.CloseHandle(handle)
 	var parts windows.SECURITY_INFORMATION = windows.OWNER_SECURITY_INFORMATION | windows.GROUP_SECURITY_INFORMATION | windows.DACL_SECURITY_INFORMATION | windows.SCOPE_SECURITY_INFORMATION | windows.LABEL_SECURITY_INFORMATION
 	sd, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, parts)
 	if err != nil {
-		return nil, sentinel(err)
+		return nil, 0, sentinel(err)
 	}
-	return securityBytes(sd), nil
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
+		return nil, 0, sentinel(err)
+	}
+	return securityBytes(sd), uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow), nil
 }
 
-func (windowsSource) share(root string) ([]byte, error) {
-	server, name, err := splitUNC(root)
+func (windowsSource) Share(root string) ([]byte, error) {
+	server, name, err := core.SplitUNC(root)
 	if err != nil {
 		return nil, err
 	}
@@ -284,10 +290,10 @@ func (windowsSource) share(root string) ([]byte, error) {
 	var info *shareInfo502
 	status, _, _ := procNetShareGetInfo.Call(uintptr(unsafe.Pointer(serverName)), uintptr(unsafe.Pointer(shareName)), 502, uintptr(unsafe.Pointer(&info)))
 	if status == 5 {
-		return nil, errDenied
+		return nil, core.ErrDenied
 	}
 	if status == 2310 {
-		return nil, errNotFound
+		return nil, core.ErrNotFound
 	}
 	if status != 0 {
 		return nil, windows.Errno(status)
@@ -324,10 +330,10 @@ func (windowsSource) share(root string) ([]byte, error) {
 	return securityBytes(relative), nil
 }
 
-func (windowsSource) accounts(filter string) ([]account, error) {
+func (windowsSource) Accounts(filter string) ([]core.Account, error) {
 	connection, _, err := procLdapInit.Call(0, 389)
 	if connection == 0 {
-		return nil, fmt.Errorf("%w: ldap init: %v", errUnavailable, err)
+		return nil, fmt.Errorf("%w: ldap init: %v", core.ErrUnavailable, err)
 	}
 	defer procLdapUnbind.Call(connection)
 	version, off, on := uint32(3), uint32(0), uint32(1)
@@ -337,58 +343,30 @@ func (windowsSource) accounts(filter string) ([]account, error) {
 	}{{ldapOptProtocolVersion, &version}, {ldapOptReferrals, &off}, {ldapOptSign, &on}, {ldapOptEncrypt, &on}}
 	for _, item := range options {
 		if code, _, _ := procLdapSetOption.Call(connection, item.option, uintptr(unsafe.Pointer(item.value))); code != 0 {
-			return nil, fmt.Errorf("%w: ldap option %#x: %d", errUnavailable, item.option, code)
+			return nil, fmt.Errorf("%w: ldap option %#x: %d", core.ErrUnavailable, item.option, code)
 		}
 	}
 	if code, _, _ := procLdapBind.Call(connection, 0, 0, ldapAuthNegotiate); code != 0 {
-		return nil, fmt.Errorf("%w: ldap bind: %d", errUnavailable, code)
+		return nil, fmt.Errorf("%w: ldap bind: %d", core.ErrUnavailable, code)
 	}
 	rootDSE, err := ldapSearch(connection, "", ldapScopeBase, "(objectClass=*)", []string{"defaultNamingContext"})
 	if err != nil {
 		return nil, err
 	}
 	if len(rootDSE) == 0 || len(rootDSE[0]["defaultNamingContext"]) == 0 {
-		return nil, fmt.Errorf("%w: no default naming context", errUnavailable)
+		return nil, fmt.Errorf("%w: no default naming context", core.ErrUnavailable)
 	}
 	base := string(rootDSE[0]["defaultNamingContext"][0])
-	results, err := ldapSearch(connection, base, ldapScopeSubtree, filter, []string{"objectSid", "objectGUID", "userPrincipalName", "mail", "proxyAddresses", "userAccountControl", "accountExpires"})
+	results, err := ldapSearch(connection, base, ldapScopeSubtree, filter, core.AccountAttributes)
 	if err != nil {
 		return nil, err
 	}
-	first := func(values map[string][][]byte, name string) string {
-		if list := values[name]; len(list) > 0 {
-			return string(list[0])
-		}
-		return ""
-	}
-	now := time.Now().UnixNano()/100 + 116444736000000000
-	var found []account
+	now := time.Now()
+	var found []core.Account
 	for _, values := range results {
-		sid, _, err := sidString([]byte(first(values, "objectSid")))
-		guid := []byte(first(values, "objectGUID"))
-		if err != nil || len(guid) != 16 {
-			continue
+		if account, ok := core.AccountOf(values, now); ok {
+			found = append(found, account)
 		}
-		var proxies []string
-		for _, proxy := range values["proxyAddresses"] {
-			if len(proxy) > 5 && strings.EqualFold(string(proxy[:5]), "smtp:") {
-				proxies = append(proxies, strings.ToLower(string(proxy[5:])))
-			}
-		}
-		control, err := strconv.ParseUint(first(values, "userAccountControl"), 10, 32)
-		enabled := err == nil && control&2 == 0
-		if value := first(values, "accountExpires"); value != "" {
-			expires, err := strconv.ParseInt(value, 10, 64)
-			enabled = enabled && err == nil && (expires == 0 || expires == math.MaxInt64 || expires > now)
-		}
-		found = append(found, account{
-			sid:     sid,
-			guid:    fmt.Sprintf("%08x-%04x-%04x-%x-%x", binary.LittleEndian.Uint32(guid[0:4]), binary.LittleEndian.Uint16(guid[4:6]), binary.LittleEndian.Uint16(guid[6:8]), guid[8:10], guid[10:16]),
-			upn:     first(values, "userPrincipalName"),
-			mail:    first(values, "mail"),
-			proxies: proxies,
-			enabled: enabled,
-		})
 	}
 	return found, nil
 }
@@ -414,7 +392,7 @@ func ldapSearch(connection uintptr, base string, scope uintptr, filter string, a
 		defer procLdapMsgFree.Call(result)
 	}
 	if code != 0 {
-		return nil, fmt.Errorf("%w: ldap search: %d", errUnavailable, code)
+		return nil, fmt.Errorf("%w: ldap search: %d", core.ErrUnavailable, code)
 	}
 	var results []map[string][][]byte
 	for item, _, _ := procLdapFirstEntry.Call(connection, result); item != 0; item, _, _ = procLdapNextEntry.Call(connection, item) {
@@ -435,7 +413,7 @@ func ldapSearch(connection uintptr, base string, scope uintptr, filter string, a
 	return results, nil
 }
 
-func (windowsSource) allowed(server string, sids []string, descriptors [][]byte) ([][]bool, error) {
+func (windowsSource) Allowed(server string, sids []string, descriptors [][]byte) ([][]bool, error) {
 	uuid, err := windows.UTF16PtrFromString("5fc860e0-6f6e-4fc2-83cd-46324f25e90b")
 	if err != nil {
 		return nil, err
@@ -498,7 +476,7 @@ func (windowsSource) allowed(server string, sids []string, descriptors [][]byte)
 	return matrix[:len(sids)], nil
 }
 
-func (windowsSource) open(root, rel string) (file, error) {
+func (windowsSource) Open(root, rel string) (core.File, error) {
 	handle, err := openInShare(root+`\`+rel, windows.FILE_READ_DATA|windows.FILE_READ_ATTRIBUTES|windows.SYNCHRONIZE, windows.FILE_SHARE_READ|windows.FILE_SHARE_DELETE, windows.FILE_FLAG_SEQUENTIAL_SCAN, false)
 	if err != nil {
 		return nil, err
@@ -511,14 +489,14 @@ func (f windowsFile) ReadAt(p []byte, off int64) (int, error) {
 	return n, sentinel(err)
 }
 
-func (f windowsFile) info() (fileInfo, error) {
+func (f windowsFile) Info() (core.FileInfo, error) {
 	var info windows.ByHandleFileInformation
 	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info); err != nil {
-		return fileInfo{}, sentinel(err)
+		return core.FileInfo{}, sentinel(err)
 	}
-	return fileInfo{
-		id:       uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow),
-		size:     int64(info.FileSizeHigh)<<32 | int64(info.FileSizeLow),
-		modified: filetime(int64(info.LastWriteTime.HighDateTime)<<32 | int64(info.LastWriteTime.LowDateTime)),
+	return core.FileInfo{
+		ID:       uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow),
+		Size:     int64(info.FileSizeHigh)<<32 | int64(info.FileSizeLow),
+		Modified: core.Filetime(int64(info.LastWriteTime.HighDateTime)<<32 | int64(info.LastWriteTime.LowDateTime)),
 	}, nil
 }

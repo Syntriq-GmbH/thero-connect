@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -13,6 +15,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/Syntriq-GmbH/thero-connect/core"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/eventlog"
@@ -37,8 +40,23 @@ type eventWriter struct {
 	log *eventlog.Log
 }
 
-func newSource() (source, error) {
-	return windowsSource{}, nil
+func main() {
+	service := isService()
+	var run func(func(context.Context) error) error
+	if service {
+		run = runService
+	}
+	core.Main(core.Platform{
+		Dir:        filepath.Join(os.Getenv("ProgramData"), "Thero Connect"),
+		Source:     newSource,
+		Protect:    protect,
+		Unprotect:  unprotect,
+		SecureDir:  secureDir,
+		Install:    install,
+		Uninstall:  uninstall,
+		RunService: run,
+		Log:        logOutput(service),
+	})
 }
 
 func protect(data []byte) ([]byte, error) {

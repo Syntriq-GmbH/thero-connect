@@ -1,3 +1,5 @@
 *.exe
 /dist/
 /thero-connect
+/thero-connect-linux-*
+/test/samba/out/

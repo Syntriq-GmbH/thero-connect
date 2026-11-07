@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"context"
@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -189,7 +190,7 @@ func writeIdentity(dir string, id identity) error {
 	if err != nil {
 		return err
 	}
-	sealed, err := protect(data)
+	sealed, err := host.Protect(data)
 	if err != nil {
 		return err
 	}
@@ -204,7 +205,7 @@ func readIdentity(dir string) (identity, *tls.Certificate, error) {
 	if err != nil {
 		return identity{}, nil, err
 	}
-	data, err := unprotect(sealed)
+	data, err := host.Unprotect(sealed)
 	if err != nil {
 		return identity{}, nil, err
 	}
@@ -255,7 +256,7 @@ func enroll(ctx context.Context, dir string, cfg config, link, pin, token string
 	}
 	defer conn.CloseNow()
 	host, _ := os.Hostname()
-	request, _ := json.Marshal(enrollMessage{Type: "enroll", Version: 1, Token: token, CSR: csr, Machine: host, Client: version})
+	request, _ := json.Marshal(enrollMessage{Type: "enroll", Version: 1, Token: token, CSR: csr, Machine: host, Client: version + " " + runtime.GOOS + "/" + runtime.GOARCH})
 	if err := conn.Write(ctx, websocket.MessageText, request); err != nil {
 		return "", err
 	}
@@ -311,7 +312,7 @@ func backoff(delay, lasted time.Duration, status websocket.StatusCode) time.Dura
 	return min(delay*2, 300*time.Second)
 }
 
-func serve(ctx context.Context, dir string, cfg config, src source) error {
+func serve(ctx context.Context, dir string, cfg config, src Source) error {
 	id, cert, err := readIdentity(dir)
 	if err != nil {
 		return err
@@ -381,7 +382,7 @@ func (a *agent) session(ctx context.Context) (websocket.StatusCode, error) {
 	for _, r := range a.cfg.Roots {
 		roots = append(roots, r.ID)
 	}
-	if err := send(helloMessage{Type: "hello", Version: 1, Client: version, Machine: host, Roots: roots}); err != nil {
+	if err := send(helloMessage{Type: "hello", Version: 1, Client: version + " " + runtime.GOOS + "/" + runtime.GOARCH, Machine: host, Roots: roots}); err != nil {
 		return websocket.CloseStatus(err), err
 	}
 	welcomeCtx, welcomeCancel := context.WithTimeout(ctx, 30*time.Second)

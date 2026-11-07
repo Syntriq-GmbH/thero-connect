@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -10,9 +12,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 	"unsafe"
 
+	"github.com/Syntriq-GmbH/thero-connect/core"
 	"golang.org/x/sys/windows"
 )
 
@@ -98,35 +100,15 @@ func TestProcsResolve(t *testing.T) {
 	}
 }
 
-func TestFiletime(t *testing.T) {
-	checks := []struct {
-		value int64
-		want  time.Time
-	}{
-		{0, time.Date(1601, 1, 1, 0, 0, 0, 0, time.UTC)},
-		{116444736000000000, time.Unix(0, 0)},
-		{116444736000000000 + 17000000000000001, time.Unix(1700000000, 100)},
-		{116444736000000000 - 1, time.Unix(0, -100)},
-	}
-	for _, check := range checks {
-		if got := filetime(check.value); !got.Equal(check.want) {
-			t.Errorf("filetime(%d) = %v, want %v", check.value, got, check.want)
-		}
-	}
-	if got := max(0, filetime(0).UnixMilli()); got != 0 {
-		t.Errorf("clamped zero filetime = %d, want 0", got)
-	}
-}
-
 func TestSentinel(t *testing.T) {
 	checks := []struct {
 		err  error
 		want error
 	}{
-		{&fs.PathError{Op: "read", Path: "a", Err: windows.ERROR_LOCK_VIOLATION}, errBusy},
-		{&fs.PathError{Op: "read", Path: "a", Err: windows.ERROR_SHARING_VIOLATION}, errBusy},
-		{&fs.PathError{Op: "read", Path: "a", Err: windows.ERROR_ACCESS_DENIED}, errDenied},
-		{windows.ERROR_BAD_NET_NAME, errNotFound},
+		{&fs.PathError{Op: "read", Path: "a", Err: windows.ERROR_LOCK_VIOLATION}, core.ErrBusy},
+		{&fs.PathError{Op: "read", Path: "a", Err: windows.ERROR_SHARING_VIOLATION}, core.ErrBusy},
+		{&fs.PathError{Op: "read", Path: "a", Err: windows.ERROR_ACCESS_DENIED}, core.ErrDenied},
+		{windows.ERROR_BAD_NET_NAME, core.ErrNotFound},
 		{io.EOF, io.EOF},
 		{nil, nil},
 	}
@@ -142,11 +124,11 @@ func TestAuthzFailure(t *testing.T) {
 		err  error
 		want error
 	}{
-		{windows.RPC_S_SERVER_UNAVAILABLE, errUnavailable},
-		{windows.EPT_S_NOT_REGISTERED, errUnavailable},
-		{windows.RPC_S_CALL_FAILED, errUnavailable},
-		{windows.RPC_S_CALL_FAILED_DNE, errUnavailable},
-		{windows.ERROR_ACCESS_DENIED, errDenied},
+		{windows.RPC_S_SERVER_UNAVAILABLE, core.ErrUnavailable},
+		{windows.EPT_S_NOT_REGISTERED, core.ErrUnavailable},
+		{windows.RPC_S_CALL_FAILED, core.ErrUnavailable},
+		{windows.RPC_S_CALL_FAILED_DNE, core.ErrUnavailable},
+		{windows.ERROR_ACCESS_DENIED, core.ErrDenied},
 		{windows.ERROR_NONE_MAPPED, nil},
 		{windows.ERROR_NO_SUCH_USER, nil},
 		{windows.ERROR_INVALID_SID, nil},
@@ -156,9 +138,6 @@ func TestAuthzFailure(t *testing.T) {
 		if check.want == nil && got != nil || check.want != nil && !errors.Is(got, check.want) {
 			t.Errorf("authzFailure(%v) = %v, want %v", check.err, got, check.want)
 		}
-	}
-	if code := codeOf(authzFailure("fs1", windows.RPC_S_SERVER_UNAVAILABLE)); code != "unavailable" {
-		t.Errorf("code = %q, want unavailable", code)
 	}
 }
 
@@ -184,7 +163,7 @@ func shareTree(t *testing.T) (string, string) {
 func TestJunctionSwapIsRefused(t *testing.T) {
 	local, root := shareTree(t)
 	src := windowsSource{}
-	f, err := src.open(root, `inner\a.txt`)
+	f, err := src.Open(root, `inner\a.txt`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,21 +175,58 @@ func TestJunctionSwapIsRefused(t *testing.T) {
 	if out, err := exec.Command("cmd", "/c", "mklink", "/J", inner, filepath.Join(local, "outside")).CombinedOutput(); err != nil {
 		t.Fatalf("mklink: %v %s", err, out)
 	}
-	if _, err := src.open(root, `inner\a.txt`); !errors.Is(err, errDenied) {
+	if _, err := src.Open(root, `inner\a.txt`); !errors.Is(err, core.ErrDenied) {
 		t.Fatalf("open through a junction: %v", err)
 	}
-	if _, err := src.list(root + `\inner`); !errors.Is(err, errDenied) {
+	if _, err := src.List(root + `\inner`); !errors.Is(err, core.ErrDenied) {
 		t.Fatalf("list of a junction: %v", err)
 	}
-	if _, err := src.descriptor(root + `\inner\a.txt`); !errors.Is(err, errDenied) {
+	if _, _, err := src.Descriptor(root + `\inner\a.txt`); !errors.Is(err, core.ErrDenied) {
 		t.Fatalf("descriptor through a junction: %v", err)
 	}
-	entries, err := src.list(root)
+	entries, err := src.List(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if slices.ContainsFunc(entries, func(e entry) bool { return e.name == "inner" }) {
+	if slices.ContainsFunc(entries, func(e core.Entry) bool { return e.Name == "inner" }) {
 		t.Fatalf("junction listed: %+v", entries)
+	}
+}
+
+func TestDescriptorIDMatchesListing(t *testing.T) {
+	_, root := shareTree(t)
+	src := windowsSource{}
+	entries, err := src.List(root + `\inner`)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("list: %v %+v", err, entries)
+	}
+	sd, id, err := src.Descriptor(root + `\inner\a.txt`)
+	if err != nil || len(sd) == 0 {
+		t.Fatalf("descriptor: %v", err)
+	}
+	f, err := src.Open(root, `inner\a.txt`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	info, err := f.Info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id == 0 || id != entries[0].ID || id != info.ID {
+		t.Fatalf("descriptor id %x, listed %x, open %x", id, entries[0].ID, info.ID)
+	}
+}
+
+func TestSourceRefusesLinuxSettings(t *testing.T) {
+	if _, err := newSource("", "thero-connect@CORP.EXAMPLE", nil); err == nil {
+		t.Fatal("principal accepted")
+	}
+	if _, err := newSource("", "", map[string]bool{"files.corp.example": true}); err == nil {
+		t.Fatal("samba host accepted")
+	}
+	if _, err := newSource("", "", map[string]bool{}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -222,11 +238,11 @@ func TestReadLocksOutWriters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := src.open(root, `inner\a.txt`); !errors.Is(err, errBusy) {
+	if _, err := src.Open(root, `inner\a.txt`); !errors.Is(err, core.ErrBusy) {
 		t.Fatalf("open beside a writer: %v", err)
 	}
 	writer.Close()
-	f, err := src.open(root, `inner\a.txt`)
+	f, err := src.Open(root, `inner\a.txt`)
 	if err != nil {
 		t.Fatal(err)
 	}

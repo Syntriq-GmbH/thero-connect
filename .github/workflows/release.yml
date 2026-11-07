@@ -17,10 +17,11 @@ jobs:
           go-version-file: go.mod
       - run: go vet ./...
       - run: go test ./...
-      - run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME#v}" -o thero-connect.exe .
-      - run: GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME#v}" -o thero-connect-arm64.exe .
-      - run: sha256sum thero-connect.exe > thero-connect.exe.sha256
-      - run: sha256sum thero-connect-arm64.exe > thero-connect-arm64.exe.sha256
-      - run: gh release create "$GITHUB_REF_NAME" thero-connect.exe thero-connect.exe.sha256 thero-connect-arm64.exe thero-connect-arm64.exe.sha256 --title "$GITHUB_REF_NAME" --generate-notes
+      - run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/Syntriq-GmbH/thero-connect/core.version=${GITHUB_REF_NAME#v}" -o thero-connect.exe ./windows
+      - run: GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/Syntriq-GmbH/thero-connect/core.version=${GITHUB_REF_NAME#v}" -o thero-connect-arm64.exe ./windows
+      - run: GOOS=linux GOARCH=amd64 GOAMD64=v1 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/Syntriq-GmbH/thero-connect/core.version=${GITHUB_REF_NAME#v}" -o thero-connect-linux-amd64 ./linux
+      - run: GOOS=linux GOARCH=arm64 GOARM64=v8.0 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/Syntriq-GmbH/thero-connect/core.version=${GITHUB_REF_NAME#v}" -o thero-connect-linux-arm64 ./linux
+      - run: for asset in thero-connect.exe thero-connect-arm64.exe thero-connect-linux-amd64 thero-connect-linux-arm64; do sha256sum "$asset" > "$asset.sha256"; done
+      - run: gh release create "$GITHUB_REF_NAME" thero-connect.exe thero-connect.exe.sha256 thero-connect-arm64.exe thero-connect-arm64.exe.sha256 thero-connect-linux-amd64 thero-connect-linux-amd64.sha256 thero-connect-linux-arm64 thero-connect-linux-arm64.sha256 --title "$GITHUB_REF_NAME" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}

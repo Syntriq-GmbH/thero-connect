@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"context"
@@ -33,7 +33,7 @@ const (
 type agent struct {
 	dir     string
 	cfg     config
-	src     source
+	src     Source
 	id      identity
 	cert    atomic.Pointer[tls.Certificate]
 	now     func() time.Time
@@ -67,7 +67,7 @@ type cachedClass struct {
 
 type pendingFile struct {
 	rel  string
-	item entry
+	item Entry
 }
 
 type walkState struct {
@@ -106,7 +106,7 @@ func (l *limiter) delay(now time.Time, n int, bytesPerSecond int64) time.Duratio
 	return wait
 }
 
-func newAgent(dir string, cfg config, src source) (*agent, error) {
+func newAgent(dir string, cfg config, src Source) (*agent, error) {
 	a := &agent{
 		dir:     dir,
 		cfg:     cfg,
@@ -206,9 +206,9 @@ func (a *agent) walk(m message) any {
 			w.files = w.files[1:]
 			var class *string
 			cached, known := previous[pending.rel]
-			if known && cached.id == pending.item.id && cached.changed.Equal(pending.item.changed) {
+			if known && cached.id == pending.item.ID && cached.changed.Equal(pending.item.Changed) {
 				class = &cached.class
-			} else if sd, err := a.src.descriptor(join(r.Path, pending.rel)); err == nil && supported(sd) == nil {
+			} else if sd, handleID, err := a.src.Descriptor(join(r.Path, pending.rel)); err == nil && handleID == pending.item.ID && supported(sd) == nil {
 				id := classOf(r.ID, sd)
 				class = &id
 				a.mu.Lock()
@@ -220,14 +220,14 @@ func (a *agent) walk(m message) any {
 			}
 			if class != nil {
 				w.seen[*class] = true
-				w.next[pending.rel] = cachedClass{id: pending.item.id, changed: pending.item.changed, class: *class}
+				w.next[pending.rel] = cachedClass{id: pending.item.ID, changed: pending.item.Changed, class: *class}
 			}
 			entries = append(entries, pageEntry{
 				Path:     pending.rel,
-				File:     fmt.Sprintf("%016x", pending.item.id),
-				Size:     pending.item.size,
-				Created:  max(0, pending.item.created.UnixMilli()),
-				Modified: max(0, pending.item.modified.UnixMilli()),
+				File:     fmt.Sprintf("%016x", pending.item.ID),
+				Size:     pending.item.Size,
+				Created:  max(0, pending.item.Created.UnixMilli()),
+				Modified: max(0, pending.item.Modified.UnixMilli()),
 				Class:    class,
 			})
 			w.listed++
@@ -238,7 +238,7 @@ func (a *agent) walk(m message) any {
 		}
 		dir := w.dirs[len(w.dirs)-1]
 		w.dirs = w.dirs[:len(w.dirs)-1]
-		items, err := a.src.list(join(r.Path, dir))
+		items, err := a.src.List(join(r.Path, dir))
 		if err != nil && dir == "" {
 			delete(a.walks, r.ID)
 			a.mu.Lock()
@@ -254,18 +254,18 @@ func (a *agent) walk(m message) any {
 			continue
 		}
 		for _, item := range items {
-			rel := item.name
+			rel := item.Name
 			if dir != "" {
-				rel = dir + "/" + item.name
+				rel = dir + "/" + item.Name
 			}
 			if excluded(r.Exclude, rel) {
 				continue
 			}
-			if _, err := validPath(rel); err != nil || (!item.dir && item.size > maxFile) {
+			if _, err := validPath(rel); err != nil || (!item.Dir && item.Size > maxFile) {
 				w.skipped++
 				continue
 			}
-			if item.dir {
+			if item.Dir {
 				w.dirs = append(w.dirs, rel)
 				continue
 			}
@@ -309,9 +309,9 @@ func (a *agent) principals(m message) any {
 			emails = append(emails, email)
 		}
 	}
-	var found []account
+	var found []Account
 	for start := 0; start < len(emails); start += 50 {
-		accounts, err := a.src.accounts(ldapFilter(emails[start:min(start+50, len(emails))]))
+		accounts, err := a.src.Accounts(ldapFilter(emails[start:min(start+50, len(emails))]))
 		if err != nil {
 			slog.Warn("principals failed", "code", codeOf(err))
 			return failure(m.ID, codeOf(err), "directory lookup failed")
@@ -344,7 +344,7 @@ func (a *agent) access(m message) any {
 			errs = append(errs, rootError{Root: r.ID, Code: "unavailable"})
 			continue
 		}
-		share, err := a.src.share(r.Path)
+		share, err := a.src.Share(r.Path)
 		if err != nil {
 			errs = append(errs, rootError{Root: r.ID, Code: codeOf(err)})
 			continue
@@ -353,8 +353,12 @@ func (a *agent) access(m message) any {
 			errs = append(errs, rootError{Root: r.ID, Code: "unsupported"})
 			continue
 		}
-		server, _, _ := splitUNC(r.Path)
-		shareRights, err := a.src.allowed(server, m.SIDs, [][]byte{share})
+		shareACL, _, _ := readACL(share, binary.LittleEndian.Uint32(share[16:]))
+		if slices.ContainsFunc(shareACL, func(item ace) bool { return item.sid == "S-1-3-4" && item.flags&0x08 == 0 }) {
+			continue
+		}
+		server, _, _ := SplitUNC(r.Path)
+		shareRights, err := a.src.Allowed(server, m.SIDs, [][]byte{share})
 		if err != nil {
 			errs = append(errs, rootError{Root: r.ID, Code: codeOf(err)})
 			continue
@@ -378,7 +382,7 @@ func (a *agent) access(m message) any {
 		if len(passing) == 0 || len(rootClasses) == 0 {
 			continue
 		}
-		matrix, err := a.src.allowed(server, passingSIDs, descriptors)
+		matrix, err := a.src.Allowed(server, passingSIDs, descriptors)
 		if err != nil {
 			errs = append(errs, rootError{Root: r.ID, Code: codeOf(err)})
 			continue
@@ -454,23 +458,23 @@ func (a *agent) read(ctx context.Context, m message, t *transfer, frame func([]b
 		}
 		a.mu.Unlock()
 	}()
-	f, err := a.src.open(r.Path, rel)
+	f, err := a.src.Open(r.Path, rel)
 	if err != nil {
 		return refuse(codeOf(err))
 	}
 	defer f.Close()
-	before, err := f.info()
+	before, err := f.Info()
 	if err != nil {
 		return refuse(codeOf(err))
 	}
-	if fmt.Sprintf("%016x", before.id) != m.File || before.size != m.Size || before.modified.UnixMilli() != m.Modified {
+	if fmt.Sprintf("%016x", before.ID) != m.File || before.Size != m.Size || before.Modified.UnixMilli() != m.Modified {
 		return refuse("changed")
 	}
 	buffer := make([]byte, 4+chunkSize)
 	binary.BigEndian.PutUint32(buffer, uint32(m.ID))
 	hash := sha256.New()
 	bytesPerSecond := int64(a.cfg.Limits.MaxMbit) * 125000
-	for sent < before.size {
+	for sent < before.Size {
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -481,7 +485,7 @@ func (a *agent) read(ctx context.Context, m message, t *transfer, frame func([]b
 				return nil
 			}
 		}
-		n := int(min(chunkSize, before.size-sent))
+		n := int(min(chunkSize, before.Size-sent))
 		read, err := f.ReadAt(buffer[4:4+n], sent)
 		if read < n && (err == nil || errors.Is(err, io.EOF)) {
 			return refuse("changed")
@@ -501,8 +505,8 @@ func (a *agent) read(ctx context.Context, m message, t *transfer, frame func([]b
 			return nil
 		}
 	}
-	after, err := f.info()
-	if err != nil || after.id != before.id || after.size != before.size || !after.modified.Equal(before.modified) {
+	after, err := f.Info()
+	if err != nil || after.ID != before.ID || after.Size != before.Size || !after.Modified.Equal(before.Modified) {
 		return refuse("changed")
 	}
 	return doneMessage{Type: "done", ID: m.ID, SHA256: hex.EncodeToString(hash.Sum(nil))}

@@ -1,6 +1,6 @@
 //go:build e2e
 
-package main
+package core
 
 import (
 	"context"
@@ -47,9 +47,9 @@ func TestE2E(t *testing.T) {
 	src := newFakeSource()
 	src.add(`\\fake\docs\alice\plan.txt`, "Alice only: kestrel-7341", readable(alice))
 	src.add(`\\fake\docs\shared\handbook.txt`, "Shared handbook: heron-2958", readable(alice, bob))
-	src.accountList = []account{
-		{sid: alice, guid: "6f1c2b3a-4d5e-4f60-8172-93a4b5c6d001", upn: os.Getenv("SMB_E2E_ALICE"), mail: os.Getenv("SMB_E2E_ALICE"), enabled: true},
-		{sid: bob, guid: "6f1c2b3a-4d5e-4f60-8172-93a4b5c6d002", upn: os.Getenv("SMB_E2E_BOB"), mail: os.Getenv("SMB_E2E_BOB"), enabled: true},
+	src.accountList = []Account{
+		{SID: alice, GUID: "6f1c2b3a-4d5e-4f60-8172-93a4b5c6d001", UPN: os.Getenv("SMB_E2E_ALICE"), Mail: os.Getenv("SMB_E2E_ALICE"), Enabled: true},
+		{SID: bob, GUID: "6f1c2b3a-4d5e-4f60-8172-93a4b5c6d002", UPN: os.Getenv("SMB_E2E_BOB"), Mail: os.Getenv("SMB_E2E_BOB"), Enabled: true},
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()

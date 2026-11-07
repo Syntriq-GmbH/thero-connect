@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"bytes"
@@ -28,7 +28,7 @@ func TestFixturesRoundTrip(t *testing.T) {
 		"error":  func() any { return &errorMessage{} },
 	}
 	serverSent := []string{"enrolled", "welcome", "walk", "principals", "access", "read", "ack", "cancel", "renewed", "error"}
-	files, _ := filepath.Glob("protocol/v1/fixtures/*.json")
+	files, _ := filepath.Glob("../protocol/v1/fixtures/*.json")
 	if len(files) != 17 {
 		t.Fatalf("%d fixtures", len(files))
 	}
@@ -71,9 +71,9 @@ func TestFixturesRoundTrip(t *testing.T) {
 
 func TestDigest(t *testing.T) {
 	var paths []string
-	filepath.WalkDir("protocol/v1", func(name string, entry fs.DirEntry, err error) error {
+	filepath.WalkDir("../protocol/v1", func(name string, entry fs.DirEntry, err error) error {
 		if err == nil && !entry.IsDir() {
-			rel, _ := filepath.Rel("protocol/v1", name)
+			rel, _ := filepath.Rel("../protocol/v1", name)
 			paths = append(paths, filepath.ToSlash(rel))
 		}
 		return err
@@ -81,7 +81,7 @@ func TestDigest(t *testing.T) {
 	slices.Sort(paths)
 	hash := sha256.New()
 	for _, rel := range paths {
-		data, _ := os.ReadFile(filepath.Join("protocol/v1", rel))
+		data, _ := os.ReadFile(filepath.Join("../protocol/v1", rel))
 		hash.Write([]byte(rel + "\x00"))
 		hash.Write(data)
 		hash.Write([]byte{0})
@@ -92,7 +92,7 @@ func TestDigest(t *testing.T) {
 }
 
 func TestChunkLayout(t *testing.T) {
-	want, _ := os.ReadFile("protocol/v1/fixtures/chunk.bin")
+	want, _ := os.ReadFile("../protocol/v1/fixtures/chunk.bin")
 	src := newFakeSource()
 	f := src.add(`\\fs01\finance\a.txt`, "thero", readable("S-1-1-0"))
 	a := testAgent(t, src)
