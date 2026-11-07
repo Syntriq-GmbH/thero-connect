@@ -225,6 +225,10 @@ func (s *fakeSource) Open(rootPath, rel string) (File, error) {
 	return &fakeHandle{src: s, f: f}, nil
 }
 
+func (s *fakeSource) Referral(unc string) (Referral, error) {
+	return Referral{}, ErrNotFound
+}
+
 type fakeHandle struct {
 	src *fakeSource
 	f   *fakeFile

@@ -491,6 +491,10 @@ func (s *linuxSource) Open(root, rel string) (core.File, error) {
 	return file, err
 }
 
+func (s *linuxSource) Referral(unc string) (core.Referral, error) {
+	return core.Referral{}, core.ErrNotFound
+}
+
 func (s *linuxSource) open(root, rel string) (core.File, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
 	defer cancel()

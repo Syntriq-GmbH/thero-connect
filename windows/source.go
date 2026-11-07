@@ -484,6 +484,10 @@ func (windowsSource) Open(root, rel string) (core.File, error) {
 	return windowsFile{os.NewFile(uintptr(handle), rel)}, nil
 }
 
+func (windowsSource) Referral(unc string) (core.Referral, error) {
+	return core.Referral{}, core.ErrNotFound
+}
+
 func (f windowsFile) ReadAt(p []byte, off int64) (int, error) {
 	n, err := f.File.ReadAt(p, off)
 	return n, sentinel(err)

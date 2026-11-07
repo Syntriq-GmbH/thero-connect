@@ -19,6 +19,7 @@ import (
 type Entry struct {
 	Name     string
 	Dir      bool
+	Link     bool
 	ID       uint64
 	Size     int64
 	Created  time.Time
@@ -47,6 +48,11 @@ type File interface {
 	Info() (FileInfo, error)
 }
 
+type Referral struct {
+	Consumed string
+	Sets     [][]string
+}
+
 type Source interface {
 	List(dir string) ([]Entry, error)
 	Descriptor(path string) ([]byte, uint64, error)
@@ -54,6 +60,7 @@ type Source interface {
 	Accounts(filter string) ([]Account, error)
 	Allowed(server string, sids []string, descriptors [][]byte) ([][]bool, error)
 	Open(root, rel string) (File, error)
+	Referral(unc string) (Referral, error)
 }
 
 type Token struct {
