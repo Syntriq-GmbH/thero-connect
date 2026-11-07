@@ -908,32 +908,35 @@ func TestDomainRefused(t *testing.T) {
 func TestDeadHostMemo(t *testing.T) {
 	s := offline()
 	unc := `\\dead.corp.example\share`
-	if _, err := s.List(unc); !errors.Is(err, core.ErrUnavailable) || strings.Contains(err.Error(), "unreachable since") {
-		t.Fatalf("first dial: %v", err)
+	if _, err := s.List(unc); !errors.Is(err, core.ErrUnavailable) || len(s.down) != 0 {
+		t.Fatalf("plain list: %v, memo %v", err, s.down)
+	}
+	if _, err := s.Referral(unc); !errors.Is(err, core.ErrUnavailable) || errors.Is(err, core.ErrNotFound) || strings.Contains(err.Error(), "unreachable since") {
+		t.Fatalf("first referral: %v", err)
 	}
 	failed := s.down["dead.corp.example"]
 	if failed.IsZero() {
-		t.Fatal("a failed dial is not remembered")
+		t.Fatal("a failed referral dial is not remembered")
 	}
 	for _, path := range []string{unc, `\\DEAD.corp.example\other\x`} {
-		if _, err := s.List(path); !errors.Is(err, core.ErrUnavailable) || !strings.Contains(err.Error(), "unreachable since") {
-			t.Errorf("remembered host %s: %v", path, err)
+		if _, err := s.Referral(path); !errors.Is(err, core.ErrUnavailable) || errors.Is(err, core.ErrNotFound) || !strings.Contains(err.Error(), "unreachable since") {
+			t.Errorf("referral to a remembered host %s: %v", path, err)
 		}
 	}
-	if _, err := s.Referral(unc); !errors.Is(err, core.ErrUnavailable) || errors.Is(err, core.ErrNotFound) || !strings.Contains(err.Error(), "unreachable since") {
-		t.Errorf("referral to a remembered host: %v", err)
+	if _, err := s.List(unc); !errors.Is(err, core.ErrUnavailable) || strings.Contains(err.Error(), "unreachable since") {
+		t.Errorf("plain list of a remembered host: %v", err)
 	}
 	if !s.down["dead.corp.example"].Equal(failed) {
-		t.Error("a remembered host was dialed again")
+		t.Error("the memo changed without a referral dial")
 	}
 	s.down["dead.corp.example"] = time.Now().Add(-downTime - time.Second)
-	if _, err := s.List(unc); !errors.Is(err, core.ErrUnavailable) || strings.Contains(err.Error(), "unreachable since") {
-		t.Errorf("dial after the memo expired: %v", err)
+	if _, err := s.Referral(unc); !errors.Is(err, core.ErrUnavailable) || strings.Contains(err.Error(), "unreachable since") {
+		t.Errorf("referral after the memo expired: %v", err)
 	}
 	if time.Since(s.down["dead.corp.example"]) > time.Minute {
 		t.Error("an expired memo is not renewed by a failed dial")
 	}
-	if _, err := s.List(`\\other.corp.example\share`); err == nil || strings.Contains(err.Error(), "unreachable since") {
+	if _, err := s.Referral(`\\other.corp.example\share`); err == nil || strings.Contains(err.Error(), "unreachable since") {
 		t.Errorf("another host is refused by the memo: %v", err)
 	}
 	if len(s.down) != 2 {

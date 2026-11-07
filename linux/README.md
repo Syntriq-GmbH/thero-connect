@@ -39,7 +39,7 @@ A root may be a domain based (`\\corp.example\projects`) or standalone (`\\fs01.
 - The client never connects to the domain name itself. Every file is listed, checked and read on the server the referral names.
 - Windows namespace servers need `DfsDnsConfig=1`, so referrals carry fully qualified names. Short names and IP addresses in referrals are skipped and the link is reported incomplete.
 - Samba namespace servers work with `follow symlinks = no`, because the client resolves every link through a referral. Samba lets other DFS clients through a link only with `follow symlinks = yes` on the namespace share; a share set that way must hold no symlinks other than DFS links, since prerequisite 6 covers the files stored in it.
-- A file server that does not answer is tried for at most 10 seconds and then skipped for 2 minutes.
+- A server that does not answer a referral request is tried for at most 10 seconds and then skipped for referrals for 2 minutes. Listing, checking and reading a root are not affected.
 
 ## Service account and keytab
 

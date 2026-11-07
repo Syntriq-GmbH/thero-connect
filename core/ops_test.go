@@ -32,7 +32,7 @@ func testAgent(t *testing.T, src Source) *agent {
 
 func walkedMounts(a *agent) {
 	for _, r := range a.cfg.Roots {
-		a.mounts[r.ID] = map[string]string{"": r.Path}
+		a.mounts[r.ID] = mountTable{Path: r.Path, Targets: map[string]string{"": r.Path}}
 	}
 	a.save("mounts.json", a.mounts)
 }
@@ -677,7 +677,7 @@ func TestWalkPlainRootUnchanged(t *testing.T) {
 	if calls := src.called("referral:"); !slices.Equal(calls, []string{`\\fs01\finance`}) {
 		t.Fatalf("referrals %v", calls)
 	}
-	if fmt.Sprint(a.mounts["finance"]) != fmt.Sprint(map[string]string{"": `\\fs01\finance`}) || a.classes[class].Target != "" {
+	if fmt.Sprint(a.mounts["finance"].Targets) != fmt.Sprint(map[string]string{"": `\\fs01\finance`}) || a.classes[class].Target != "" {
 		t.Fatalf("mounts %v, registry %v", a.mounts, a.classes)
 	}
 }
@@ -701,8 +701,8 @@ func TestWalkStandaloneLink(t *testing.T) {
 	if a.classes[*linked.Class].Target != `\\fs2.corp\docs` || a.classes[*readme.Class].Target != "" {
 		t.Fatalf("registry %+v", a.classes)
 	}
-	if fmt.Sprint(a.mounts["ns"]) != fmt.Sprint(map[string]string{"": `\\fs1.corp\ns`, "docs": `\\fs2.corp\docs`}) {
-		t.Fatalf("mounts %v", a.mounts["ns"])
+	if fmt.Sprint(a.mounts["ns"].Targets) != fmt.Sprint(map[string]string{"": `\\fs1.corp\ns`, "docs": `\\fs2.corp\docs`}) {
+		t.Fatalf("mounts %v", a.mounts["ns"].Targets)
 	}
 	if lists := src.called("list:"); !slices.Equal(lists, []string{`\\fs1.corp\ns`, `\\fs2.corp\docs`, `\\fs2.corp\docs\a`}) {
 		t.Fatalf("lists %v", lists)
@@ -723,8 +723,8 @@ func TestWalkDomainRoot(t *testing.T) {
 	if len(entries) != 1 || entries[0].File != fmt.Sprintf("%016x", first.id^bind(key)) || *entries[0].Class != classOf(scope("ns", key), sd) {
 		t.Fatalf("entries %+v", entries)
 	}
-	if a.mounts["ns"][""] != key || a.classes[*entries[0].Class].Target != key {
-		t.Fatalf("mounts %v", a.mounts["ns"])
+	if a.mounts["ns"].Targets[""] != key || a.classes[*entries[0].Class].Target != key {
+		t.Fatalf("mounts %v", a.mounts["ns"].Targets)
 	}
 	for _, list := range src.called("list:") {
 		if strings.HasPrefix(strings.ToLower(list), `\\corp.example`) {
@@ -754,9 +754,9 @@ func TestWalkTargetOrder(t *testing.T) {
 		a := dfsAgent(t, src, root{ID: "ns", Path: `\\fs1.corp\ns`})
 		for walk, sets := range c.sets {
 			refer(src, `\\fs1.corp\ns\docs`, sets...)
-			a.mounts = map[string]map[string]string{}
+			a.mounts = map[string]mountTable{}
 			walkAll(t, a, "ns")
-			if got := a.mounts["ns"]["docs"]; got != c.want {
+			if got := a.mounts["ns"].Targets["docs"]; got != c.want {
 				t.Errorf("%s walk %d chose %s", c.name, walk, got)
 			}
 		}
@@ -776,13 +776,13 @@ func TestWalkFailover(t *testing.T) {
 		page := a.walk(message{Type: "walk", ID: 1, Root: "ns"}).(pageMessage)
 		listedSecond := slices.Contains(src.called("list:"), `\\fs3.corp\docs`)
 		if failure == ErrDenied {
-			if !slices.Equal(page.Incomplete, []string{"docs"}) || listedSecond || a.mounts["ns"]["docs"] != "" {
+			if !slices.Equal(page.Incomplete, []string{"docs"}) || listedSecond || a.mounts["ns"].Targets["docs"] != "" {
 				t.Errorf("%s: incomplete %v, second listed %v", name, page.Incomplete, listedSecond)
 			}
 			continue
 		}
-		if len(page.Incomplete) != 0 || a.mounts["ns"]["docs"] != `\\fs3.corp\docs` || len(byPath(page.Entries)) != 2 {
-			t.Errorf("%s: page %+v, mounts %v", name, page, a.mounts["ns"])
+		if len(page.Incomplete) != 0 || a.mounts["ns"].Targets["docs"] != `\\fs3.corp\docs` || len(byPath(page.Entries)) != 2 {
+			t.Errorf("%s: page %+v, mounts %v", name, page, a.mounts["ns"].Targets)
 		}
 	}
 }
@@ -797,14 +797,14 @@ func TestWalkPinnedTarget(t *testing.T) {
 	src.failures[`list:\\fs2.corp\a`] = ErrUnavailable
 	a := dfsAgent(t, src, root{ID: "ns", Path: `\\fs1.corp\ns`})
 	walkAll(t, a, "ns")
-	first := a.mounts["ns"]["docs"]
+	first := a.mounts["ns"].Targets["docs"]
 	delete(src.failures, `list:\\fs2.corp\a`)
 	restarted, _ := newAgent(a.dir, a.cfg, src)
 	walkAll(t, restarted, "ns")
-	second := restarted.mounts["ns"]["docs"]
+	second := restarted.mounts["ns"].Targets["docs"]
 	refer(src, `\\fs1.corp\ns\docs`, []string{`\\fs2.corp\a`})
 	walkAll(t, restarted, "ns")
-	third := restarted.mounts["ns"]["docs"]
+	third := restarted.mounts["ns"].Targets["docs"]
 	if first != `\\fs2.corp\b` || second != `\\fs2.corp\b` || third != `\\fs2.corp\a` {
 		t.Fatalf("targets %s %s %s", first, second, third)
 	}
@@ -851,8 +851,8 @@ func TestWalkInterlink(t *testing.T) {
 	if !ok || got.File != fmt.Sprintf("%016x", f.id^bind(`\\fs3.corp\data`)) || *got.Class != classOf(scope("ns", `\\fs3.corp\data`), sd) {
 		t.Fatalf("entries %+v", entries)
 	}
-	if a.mounts["ns"]["x"] != `\\fs3.corp\data\deep` {
-		t.Fatalf("mounts %v", a.mounts["ns"])
+	if a.mounts["ns"].Targets["x"] != `\\fs3.corp\data\deep` {
+		t.Fatalf("mounts %v", a.mounts["ns"].Targets)
 	}
 	want := []string{`\\fs1.corp\ns`, `\\fs1.corp\ns\x`, `\\corp.example\ns2\x`, `\\ns2.corp.example\ns2\x`, `\\fs3.corp\data\deep`}
 	if calls := src.called("referral:"); !slices.Equal(calls, want) {
@@ -907,7 +907,7 @@ func TestWalkOverlappingMounts(t *testing.T) {
 	defer slog.SetDefault(previous)
 	a := dfsAgent(t, src, root{ID: "ns", Path: `\\fs1.corp\ns`})
 	page := a.walk(message{Type: "walk", ID: 1, Root: "ns"}).(pageMessage)
-	mounts := a.mounts["ns"]
+	mounts := a.mounts["ns"].Targets
 	docs := mounts["a1"] != "" != (mounts["a2"] != "")
 	data := mounts["child"] != "" != (mounts["parent"] != "")
 	if len(page.Incomplete) != 0 || mounts["self"] != "" || mounts["inside"] != "" || !docs || !data || len(mounts) != 3 {
@@ -923,8 +923,8 @@ func TestWalkOverlappingMounts(t *testing.T) {
 	}
 	again := dfsAgent(t, src, root{ID: "ns", Path: `\\fs1.corp\ns`})
 	walkAll(t, again, "ns")
-	if fmt.Sprint(again.mounts["ns"]) != fmt.Sprint(mounts) {
-		t.Fatalf("second walk chose %v, first %v", again.mounts["ns"], mounts)
+	if fmt.Sprint(again.mounts["ns"].Targets) != fmt.Sprint(mounts) {
+		t.Fatalf("second walk chose %v, first %v", again.mounts["ns"].Targets, mounts)
 	}
 }
 
@@ -960,8 +960,8 @@ func TestWalkDropsInvalidCandidates(t *testing.T) {
 	src.add(valid+`\x.txt`, "x", readable("S-1-1-0"))
 	a := dfsAgent(t, src, root{ID: "ns", Path: `\\fs1.corp\ns`})
 	entries := walkAll(t, a, "ns")
-	if a.mounts["ns"]["docs"] != valid || byPath(entries)["docs/x.txt"].Class == nil {
-		t.Fatalf("mounts %v, entries %+v", a.mounts["ns"], entries)
+	if a.mounts["ns"].Targets["docs"] != valid || byPath(entries)["docs/x.txt"].Class == nil {
+		t.Fatalf("mounts %v, entries %+v", a.mounts["ns"].Targets, entries)
 	}
 	if calls := src.called("referral:"); !slices.Equal(calls, []string{`\\fs1.corp\ns`, `\\fs1.corp\ns\docs`, valid}) {
 		t.Fatalf("referrals %v", calls)
@@ -1023,8 +1023,8 @@ func TestWalkMountLimit(t *testing.T) {
 	a := dfsAgent(t, src, root{ID: "ns", Path: `\\fs1.corp\ns`})
 	page := a.walk(message{Type: "walk", ID: 1, Root: "ns"}).(pageMessage)
 	slices.Sort(page.Incomplete)
-	if len(a.mounts["ns"]) != 2 || !slices.Equal(page.Incomplete, []string{"a", "b"}) || len(src.called("referral:")) != 3 {
-		t.Fatalf("mounts %v, incomplete %v, referrals %v", a.mounts["ns"], page.Incomplete, src.called("referral:"))
+	if len(a.mounts["ns"].Targets) != 3 || !slices.Equal(page.Incomplete, []string{"a"}) || len(src.called("referral:")) != 5 {
+		t.Fatalf("mounts %v, incomplete %v, referrals %v", a.mounts["ns"].Targets, page.Incomplete, src.called("referral:"))
 	}
 }
 
@@ -1035,8 +1035,8 @@ func TestWalkExcludedLinkNotResolved(t *testing.T) {
 	refer(src, `\\fs1.corp\ns\Private`, []string{`\\fs2.corp\private`})
 	a := dfsAgent(t, src, root{ID: "ns", Path: `\\fs1.corp\ns`, Exclude: []string{"private"}})
 	walkAll(t, a, "ns")
-	if calls := src.called("referral:"); !slices.Equal(calls, []string{`\\fs1.corp\ns`}) || len(a.mounts["ns"]) != 1 {
-		t.Fatalf("referrals %v, mounts %v", calls, a.mounts["ns"])
+	if calls := src.called("referral:"); !slices.Equal(calls, []string{`\\fs1.corp\ns`}) || len(a.mounts["ns"].Targets) != 1 {
+		t.Fatalf("referrals %v, mounts %v", calls, a.mounts["ns"].Targets)
 	}
 }
 
@@ -1217,5 +1217,123 @@ func TestStateMountsAndTargets(t *testing.T) {
 	writeFile(statePath(a.dir, "mounts.json"), []byte("{"))
 	if _, err := newAgent(a.dir, a.cfg, src); err == nil || !strings.Contains(err.Error(), "mounts.json") {
 		t.Fatalf("corrupt mounts.json loaded: %v", err)
+	}
+}
+
+func TestWalkLinkWithoutReferralIncomplete(t *testing.T) {
+	src := newFakeSource()
+	namespace(src)
+	src.links[`\\fs1.corp\ns\docs`] = true
+	src.add(`\\fs1.corp\ns\docs\x.txt`, "x", readable("S-1-1-0"))
+	var logged strings.Builder
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
+	defer slog.SetDefault(previous)
+	a := dfsAgent(t, src, root{ID: "ns", Path: `\\fs1.corp\ns`})
+	page := a.walk(message{Type: "walk", ID: 1, Root: "ns"}).(pageMessage)
+	if !slices.Equal(page.Incomplete, []string{"docs"}) || !strings.Contains(logged.String(), "skipped=0") || slices.Contains(src.called("list:"), `\\fs1.corp\ns\docs`) {
+		t.Fatalf("incomplete %v, lists %v, log %s", page.Incomplete, src.called("list:"), logged.String())
+	}
+}
+
+func TestRootPathChangeDropsState(t *testing.T) {
+	alice := "S-1-5-21-1-2-3-1104"
+	src := newFakeSource()
+	namespace(src)
+	src.links[`\\fs1.corp\ns\docs`] = true
+	refer(src, `\\fs1.corp\ns\docs`, []string{`\\fs2.corp\docs`})
+	f := src.add(`\\fs2.corp\docs\x.txt`, "x", readable(alice))
+	refer(src, `\\fs1.corp\public`, []string{`\\fs1.corp\public`})
+	a := dfsAgent(t, src, root{ID: "ns", Path: `\\fs1.corp\ns`}, root{ID: "plain", Path: `\\fs6.corp\p`})
+	walkAll(t, a, "ns")
+	a.walked["plain"] = a.now()
+	a.save("walks.json", a.walked)
+	moved := config{Roots: []root{{ID: "ns", Path: `\\fs1.corp\public`}, {ID: "plain", Path: `\\fs6.corp\p`}}, Limits: a.cfg.Limits}
+	restarted, err := newAgent(a.dir, moved, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := restarted.mounts["ns"]; ok || len(restarted.classes) != 0 || !restarted.walked["ns"].IsZero() {
+		t.Fatalf("mounts %v, classes %v, walked %v", restarted.mounts, restarted.classes, restarted.walked)
+	}
+	if restarted.mounts["plain"].Path != `\\fs6.corp\p` {
+		t.Fatalf("unchanged root lost its table: %v", restarted.mounts)
+	}
+	record := fmt.Sprintf("%016x", f.id^bind(`\\fs2.corp\docs`))
+	reply := restarted.read(t.Context(), message{Type: "read", ID: 3, Root: "ns", Path: "docs/x.txt", File: record, Size: 1, Modified: f.modified.UnixMilli()}, openWindow(), func([]byte) error { return nil })
+	if codeOfReply(reply) != "unavailable" || len(src.called("open:")) != 0 {
+		t.Fatalf("read after a path change answered %+v, opens %v", reply, src.called("open:"))
+	}
+	a.cfg = moved
+	a.mounts["plain"] = restarted.mounts["plain"]
+	rights := a.access(message{Type: "access", ID: 4, SIDs: []string{alice}}).(rightsMessage)
+	for _, c := range rights.Classes {
+		if len(c.Readers) != 0 {
+			t.Fatalf("class %s of a moved root has readers %v", c.Class, c.Readers)
+		}
+	}
+	if fmt.Sprint(rights.Errors) != "[{ns unavailable}]" {
+		t.Fatalf("errors %v", rights.Errors)
+	}
+}
+
+func TestUpgradeSeedsPhysicalTable(t *testing.T) {
+	alice := "S-1-5-21-1-2-3-1104"
+	src := newFakeSource()
+	f := src.add(`\\fs01\finance\a.txt`, "a", readable(alice))
+	namespace(src)
+	src.links[`\\fs1.corp\ns\docs`] = true
+	refer(src, `\\fs1.corp\ns\docs`, []string{`\\fs2.corp\docs`})
+	src.add(`\\fs2.corp\docs\x.txt`, "x", readable(alice))
+	a := dfsAgent(t, src, root{ID: "finance", Path: `\\fs01\finance`}, root{ID: "ns", Path: `\\fs1.corp\ns`}, root{ID: "fresh", Path: `\\fs7.corp\f`})
+	walkAll(t, a, "finance")
+	walkAll(t, a, "ns")
+	os.Remove(statePath(a.dir, "mounts.json"))
+	upgraded, err := newAgent(a.dir, a.cfg, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(upgraded.mounts) != fmt.Sprint(map[string]mountTable{"finance": {Path: `\\fs01\finance`, Targets: map[string]string{"": `\\fs01\finance`}}}) {
+		t.Fatalf("mounts %v", upgraded.mounts)
+	}
+	if _, reply := readFile(upgraded, "finance", "a.txt", f); codeOfReply(reply) != "done" {
+		t.Fatalf("read after upgrade answered %+v", reply)
+	}
+	rights := upgraded.access(message{Type: "access", ID: 1, SIDs: []string{alice}}).(rightsMessage)
+	readers := map[string][]int{}
+	for _, c := range rights.Classes {
+		readers[c.Class] = c.Readers
+	}
+	if !slices.Equal(readers[classOf("finance", readable(alice))], []int{0}) || fmt.Sprint(rights.Errors) != "[{ns unavailable} {fresh unavailable}]" {
+		t.Fatalf("readers %v, errors %v", readers, rights.Errors)
+	}
+}
+
+func TestAccessOneContextPerServer(t *testing.T) {
+	alice, bob := "S-1-5-21-1-2-3-1104", "S-1-5-21-1-2-3-1105"
+	src := newFakeSource()
+	namespace(src)
+	src.shares[`\\fs1.corp\ns`] = readable(alice)
+	for _, name := range []string{"a", "b", "c"} {
+		src.links[`\\fs1.corp\ns\`+name] = true
+		refer(src, `\\fs1.corp\ns\`+name, []string{`\\fs2.corp\` + name})
+		src.add(`\\fs2.corp\`+name+`\x.txt`, name, readable(alice, bob))
+	}
+	src.shares[`\\fs2.corp\a`] = readable(alice, bob)
+	src.shares[`\\fs2.corp\b`] = readable(alice)
+	src.shares[`\\fs2.corp\c`] = readable("S-1-5-21-1-2-3-1199")
+	a := dfsAgent(t, src, root{ID: "ns", Path: `\\fs1.corp\ns`})
+	entries := byPath(walkAll(t, a, "ns"))
+	src.authzCalls = nil
+	rights := a.access(message{Type: "access", ID: 1, SIDs: []string{alice, bob}}).(rightsMessage)
+	readers := map[string][]int{}
+	for _, c := range rights.Classes {
+		readers[c.Class] = c.Readers
+	}
+	if !slices.Equal(readers[*entries["a/x.txt"].Class], []int{0, 1}) || !slices.Equal(readers[*entries["b/x.txt"].Class], []int{0}) || len(readers[*entries["c/x.txt"].Class]) != 0 || len(rights.Errors) != 0 {
+		t.Fatalf("readers %v, errors %v", readers, rights.Errors)
+	}
+	if fmt.Sprint(src.authzCalls) != fmt.Sprint([][]string{{"fs1.corp", alice, bob}, {"fs1.corp", alice}, {"fs2.corp", alice, bob}, {"fs2.corp", alice, bob}}) {
+		t.Fatalf("authz calls %v", src.authzCalls)
 	}
 }

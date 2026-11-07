@@ -186,8 +186,8 @@ func check(dir string) error {
 	if report("source", err) {
 		probe := &agent{cfg: cfg, src: src}
 		for _, r := range cfg.Roots {
-			budget := 16
-			target, _, err := probe.locate(r.Path, "", map[string]string{}, &budget)
+			budget := referralHops
+			target, _, err := probe.locate(r.Path, "", map[string]bool{}, &budget)
 			if !report("root "+r.ID+" list", err) {
 				continue
 			}

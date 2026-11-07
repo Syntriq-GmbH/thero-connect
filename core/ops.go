@@ -26,12 +26,13 @@ import (
 )
 
 const (
-	pageSize    = 500
-	chunkSize   = 262144
-	ackWindow   = 4 << 20
-	readSlots   = 2
-	snapshotAge = 6 * time.Hour
-	pageTime    = 120 * time.Second
+	pageSize     = 500
+	chunkSize    = 262144
+	ackWindow    = 4 << 20
+	readSlots    = 2
+	snapshotAge  = 6 * time.Hour
+	pageTime     = 120 * time.Second
+	referralHops = 16
 )
 
 var mountLimit = 10000
@@ -55,7 +56,12 @@ type agent struct {
 	walkMu  sync.Mutex
 	walks   map[string]*walkState
 	cache   map[string]map[string]cachedClass
-	mounts  map[string]map[string]string
+	mounts  map[string]mountTable
+}
+
+type mountTable struct {
+	Path    string            `json:"path"`
+	Targets map[string]string `json:"targets"`
 }
 
 type classEntry struct {
@@ -89,6 +95,7 @@ type walkState struct {
 	dirs       []pendingFile
 	files      []pendingFile
 	mounts     map[string]string
+	taken      map[string]bool
 	seen       map[string]bool
 	next       map[string]cachedClass
 	listed     int
@@ -129,7 +136,7 @@ func newAgent(dir string, cfg config, src Source) (*agent, error) {
 		slots:   make(chan struct{}, readSlots),
 		walks:   map[string]*walkState{},
 		cache:   map[string]map[string]cachedClass{},
-		mounts:  map[string]map[string]string{},
+		mounts:  map[string]mountTable{},
 	}
 	for name, target := range map[string]any{"classes.json": &a.classes, "quota.json": &a.quota, "walks.json": &a.walked, "mounts.json": &a.mounts} {
 		data, err := os.ReadFile(statePath(dir, name))
@@ -146,6 +153,26 @@ func newAgent(dir string, cfg config, src Source) (*agent, error) {
 	for id, entry := range a.classes {
 		if supported(entry.SD) != nil || classOf(scope(entry.Root, entry.Target), entry.SD) != id {
 			delete(a.classes, id)
+		}
+	}
+	for _, r := range cfg.Roots {
+		table, stored := a.mounts[r.ID]
+		_, walked := a.walked[r.ID]
+		targeted := false
+		for _, entry := range a.classes {
+			targeted = targeted || entry.Root == r.ID && entry.Target != ""
+		}
+		switch {
+		case !stored && walked && !targeted:
+			a.mounts[r.ID] = mountTable{Path: r.Path, Targets: map[string]string{"": r.Path}}
+		case stored && table.Path != r.Path:
+			delete(a.mounts, r.ID)
+			delete(a.walked, r.ID)
+			for id, entry := range a.classes {
+				if entry.Root == r.ID {
+					delete(a.classes, id)
+				}
+			}
 		}
 	}
 	return a, nil
@@ -198,22 +225,25 @@ func physical(mounts map[string]string, rootPath, rel string) (string, string, s
 	}
 }
 
-func (a *agent) locate(unc, pin string, mounts map[string]string, budget *int) (string, []Entry, error) {
+func (a *agent) locate(unc, pin string, taken map[string]bool, budget *int) (string, []Entry, error) {
 	if *budget == 0 {
 		return "", nil, ErrUnavailable
 	}
+	top := *budget == referralHops
 	*budget--
 	ref, err := a.src.Referral(unc)
 	self := err == nil && slices.ContainsFunc(slices.Concat(ref.Sets...), func(target string) bool { return strings.EqualFold(target, ref.Consumed) })
 	if errors.Is(err, ErrNotFound) || self {
-		for _, target := range mounts {
-			inner, outer := unc, target
-			if len(inner) < len(outer) {
-				inner, outer = outer, inner
-			}
-			if strings.EqualFold(inner[:len(outer)], outer) && (len(inner) == len(outer) || inner[len(outer)] == '\\') {
-				return "", nil, errOverlap
-			}
+		lower := strings.ToLower(unc)
+		_, overlap := taken[lower]
+		for i := strings.LastIndex(lower, `\`); i > 2 && !overlap; i = strings.LastIndex(lower[:i], `\`) {
+			overlap = taken[lower[:i]]
+		}
+		if overlap && top && !self {
+			return "", nil, ErrUnavailable
+		}
+		if overlap {
+			return "", nil, errOverlap
 		}
 		items, err := a.src.List(unc)
 		return unc, items, err
@@ -253,7 +283,7 @@ func (a *agent) locate(unc, pin string, mounts map[string]string, budget *int) (
 	}
 	err = ErrUnavailable
 	for _, candidate := range candidates {
-		target, items, failed := a.locate(candidate+rest, pin, mounts, budget)
+		target, items, failed := a.locate(candidate+rest, pin, taken, budget)
 		if failed == nil || !errors.Is(failed, ErrUnavailable) && !errors.Is(failed, ErrNotFound) {
 			return target, items, failed
 		}
@@ -283,14 +313,14 @@ func (a *agent) walk(m message) any {
 	if m.Cursor == "" {
 		nonce := make([]byte, 8)
 		rand.Read(nonce)
-		w = &walkState{nonce: hex.EncodeToString(nonce), started: a.now(), dirs: []pendingFile{{item: Entry{Dir: true, Link: true}}}, mounts: map[string]string{}, seen: map[string]bool{}, next: map[string]cachedClass{}}
+		w = &walkState{nonce: hex.EncodeToString(nonce), started: a.now(), dirs: []pendingFile{{item: Entry{Dir: true, Link: true}}}, mounts: map[string]string{}, taken: map[string]bool{}, seen: map[string]bool{}, next: map[string]cachedClass{}}
 		a.walks[r.ID] = w
 	}
 	if w == nil || m.Cursor != w.cursor {
 		return failure(m.ID, "cursor", "unknown walk cursor")
 	}
 	a.mu.Lock()
-	pins := a.mounts[r.ID]
+	pins := a.mounts[r.ID].Targets
 	a.mu.Unlock()
 	previous := a.cache[r.ID]
 	maxFile := int64(a.cfg.Limits.MaxFileMB) << 20
@@ -347,14 +377,18 @@ func (a *agent) walk(m message) any {
 		switch {
 		case !pending.item.Link:
 			items, err = a.src.List(path)
-		case len(w.mounts) >= mountLimit:
+		case len(w.mounts) > mountLimit:
 			err = ErrUnavailable
 		default:
-			budget := 16
+			budget := referralHops
 			var target string
-			target, items, err = a.locate(path, pins[dir], w.mounts, &budget)
+			target, items, err = a.locate(path, pins[dir], w.taken, &budget)
 			if err == nil {
 				w.mounts[dir] = target
+				lower := strings.ToLower(target)
+				for i := len(lower); i > 2; i = strings.LastIndex(lower[:i], `\`) {
+					w.taken[lower[:i]] = w.taken[lower[:i]] || i == len(lower)
+				}
 			}
 		}
 		if err != nil && dir == "" {
@@ -410,7 +444,7 @@ func (a *agent) walk(m message) any {
 		}
 		a.walked[r.ID] = w.started
 		a.save("walks.json", a.walked)
-		a.mounts[r.ID] = w.mounts
+		a.mounts[r.ID] = mountTable{Path: r.Path, Targets: w.mounts}
 		a.save("mounts.json", a.mounts)
 		a.mu.Unlock()
 		targets := map[string]bool{}
@@ -466,7 +500,8 @@ func (a *agent) access(m message) any {
 	readers := map[string][]int{}
 	errs := []rootError{}
 	for _, r := range a.cfg.Roots {
-		if at, ok := walked[r.ID]; !ok || a.now().Sub(at) > snapshotAge {
+		table := mounts[r.ID]
+		if at, ok := walked[r.ID]; !ok || a.now().Sub(at) > snapshotAge || table.Path != r.Path {
 			errs = append(errs, rootError{Root: r.ID, Code: "unavailable"})
 			continue
 		}
@@ -483,10 +518,12 @@ func (a *agent) access(m message) any {
 				byTarget[registry[id].Target] = append(byTarget[registry[id].Target], id)
 			}
 		}
+		byServer := map[string][]string{}
+		shares := map[string][]byte{}
 		for _, key := range slices.Sorted(maps.Keys(byTarget)) {
 			sharePath := key
 			if key == "" {
-				if rootMount, ok := mounts[r.ID][""]; !ok || shareOf(rootMount) != shareOf(r.Path) {
+				if shareOf(table.Targets[""]) != shareOf(r.Path) {
 					fail("unavailable")
 					continue
 				}
@@ -506,7 +543,16 @@ func (a *agent) access(m message) any {
 				continue
 			}
 			server, _, _ := SplitUNC(sharePath)
-			shareRights, err := a.src.Allowed(server, m.SIDs, [][]byte{share})
+			byServer[server] = append(byServer[server], key)
+			shares[key] = share
+		}
+		for _, server := range slices.Sorted(maps.Keys(byServer)) {
+			keys := byServer[server]
+			shareDescriptors := make([][]byte, len(keys))
+			for c, key := range keys {
+				shareDescriptors[c] = shares[key]
+			}
+			shareRights, err := a.src.Allowed(server, m.SIDs, shareDescriptors)
 			if err != nil {
 				fail(codeOf(err))
 				continue
@@ -514,7 +560,7 @@ func (a *agent) access(m message) any {
 			var passing []int
 			var passingSIDs []string
 			for k, row := range shareRights {
-				if row[0] {
+				if slices.Contains(row, true) {
 					passing = append(passing, k)
 					passingSIDs = append(passingSIDs, m.SIDs[k])
 				}
@@ -522,18 +568,24 @@ func (a *agent) access(m message) any {
 			if len(passing) == 0 {
 				continue
 			}
-			descriptors := make([][]byte, 0, len(byTarget[key]))
-			for _, id := range byTarget[key] {
-				descriptors = append(descriptors, registry[id].SD)
+			var classIDs []string
+			var columns []int
+			var descriptors [][]byte
+			for c, key := range keys {
+				for _, id := range byTarget[key] {
+					classIDs = append(classIDs, id)
+					columns = append(columns, c)
+					descriptors = append(descriptors, registry[id].SD)
+				}
 			}
 			matrix, err := a.src.Allowed(server, passingSIDs, descriptors)
 			if err != nil {
 				fail(codeOf(err))
 				continue
 			}
-			for j, id := range byTarget[key] {
+			for j, id := range classIDs {
 				for k, index := range passing {
-					if matrix[k][j] {
+					if matrix[k][j] && shareRights[index][columns[j]] {
 						readers[id] = append(readers[id], index)
 					}
 				}
@@ -564,12 +616,12 @@ func (a *agent) read(ctx context.Context, m message, t *transfer, frame func([]b
 		return refuse("not_found")
 	}
 	a.mu.Lock()
-	mounts := a.mounts[r.ID]
+	table := a.mounts[r.ID]
 	a.mu.Unlock()
-	if len(mounts) == 0 {
+	if table.Path != r.Path {
 		return refuse("unavailable")
 	}
-	target, rest, key := physical(mounts, r.Path, m.Path)
+	target, rest, key := physical(table.Targets, r.Path, m.Path)
 	if rest == "" {
 		return refuse("not_found")
 	}

@@ -256,25 +256,16 @@ func (s *linuxSource) tree(ctx context.Context, unc string) (tree, string, error
 	defer lock.Unlock()
 	s.mu.Lock()
 	c := s.connections[server]
-	failed := s.down[server]
 	s.mu.Unlock()
 	reused := c != nil
 	if c == nil {
-		if time.Since(failed) < downTime {
-			return tree{}, "", fmt.Errorf("%w: smb %s: unreachable since %s", core.ErrUnavailable, server, failed.Format(time.RFC3339))
-		}
 		dialer := smb2.Dialer{Credentials: s.smb, RequireMessageSigning: true, DisableAAPLExtension: true, SpecifiedDialects: []smb2.Dialect{smb2.SMB311, smb2.SMB302, smb2.SMB300}}
-		dialing, cancel := context.WithTimeout(ctx, dialTimeout)
-		session, err := dialer.Dial(dialing, server)
-		cancel()
-		s.mu.Lock()
+		session, err := dialer.Dial(ctx, server)
 		if err != nil {
-			s.down[server] = time.Now()
-			s.mu.Unlock()
 			return tree{}, "", fmt.Errorf("%w: smb %s: %v", core.ErrUnavailable, server, err)
 		}
-		delete(s.down, server)
 		c = &connection{session: session, shares: map[string]*smb2.Share{}}
+		s.mu.Lock()
 		s.connections[server] = c
 		s.mu.Unlock()
 	}
@@ -566,10 +557,27 @@ func (s *linuxSource) referral(unc string) (core.Referral, error) {
 	}
 	var failures []error
 	for _, server := range servers {
-		t, _, err := s.tree(ctx, `\\`+server+`\IPC$`)
+		key := strings.ToLower(server)
+		s.mu.Lock()
+		failed := s.down[key]
+		s.mu.Unlock()
+		if time.Since(failed) < downTime {
+			failures = append(failures, fmt.Errorf("%w: smb %s: unreachable since %s", core.ErrUnavailable, server, failed.Format(time.RFC3339)))
+			continue
+		}
+		dialing, cancel := context.WithTimeout(ctx, dialTimeout)
+		t, _, err := s.tree(dialing, `\\`+server+`\IPC$`)
+		cancel()
 		if errors.Is(err, errSessionExpired) || errors.Is(err, errRetry) {
 			return core.Referral{}, err
 		}
+		s.mu.Lock()
+		if errors.Is(err, core.ErrUnavailable) {
+			s.down[key] = time.Now()
+		} else {
+			delete(s.down, key)
+		}
+		s.mu.Unlock()
 		if err != nil && !domain && !errors.Is(err, core.ErrUnavailable) {
 			return core.Referral{}, core.ErrNotFound
 		}

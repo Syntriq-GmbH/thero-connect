@@ -16,11 +16,13 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+const nerrDfsNoSuchVolume = windows.Errno(2662)
+
 type windowsSource struct{}
 
 func newSource(dir, principal string, samba map[string]bool) (core.Source, error) {
 	if principal != "" || len(samba) > 0 {
-		return nil, errors.New("principal and server: samba need the Linux client")
+		return nil, errors.New("principal, server: samba and samba_servers need the Linux client")
 	}
 	return windowsSource{}, nil
 }
@@ -562,19 +564,21 @@ func (windowsSource) Referral(unc string) (core.Referral, error) {
 		}
 		var info *dfsInfo3
 		status, _, _ := procNetDfsGetClientInfo.Call(uintptr(unsafe.Pointer(prefix)), 0, 0, 3, uintptr(unsafe.Pointer(&info)))
-		if info != nil {
-			defer windows.NetApiBufferFree((*byte)(unsafe.Pointer(info)))
+		if status == 0 && info != nil {
+			referral, err := referralOf(unc, info)
+			windows.NetApiBufferFree((*byte)(unsafe.Pointer(info)))
+			return referral, err
 		}
-		switch status {
-		case 2662, 1168, 2, 3:
+		if info != nil {
+			windows.NetApiBufferFree((*byte)(unsafe.Pointer(info)))
+		}
+		switch windows.Errno(status) {
+		case nerrDfsNoSuchVolume, windows.ERROR_NOT_FOUND, windows.ERROR_FILE_NOT_FOUND, windows.ERROR_PATH_NOT_FOUND:
 			continue
-		case 5:
+		case windows.ERROR_ACCESS_DENIED:
 			return core.Referral{}, core.ErrDenied
 		case 0:
-			if info == nil {
-				return core.Referral{}, fmt.Errorf("%w: empty dfs answer for %s", core.ErrUnavailable, unc)
-			}
-			return referralOf(unc, info)
+			return core.Referral{}, fmt.Errorf("%w: empty dfs answer for %s", core.ErrUnavailable, unc)
 		}
 		return core.Referral{}, fmt.Errorf("%w: dfs client info for %s: %v", core.ErrUnavailable, unc, windows.Errno(status))
 	}
