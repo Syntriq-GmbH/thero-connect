@@ -367,9 +367,19 @@ func (a *agent) access(m message) any {
 			membersErr = ErrUnavailable
 		}
 	}
+	left := 0
 	for _, r := range a.cfg.Roots {
 		if r.URL != "" {
-			found, code := a.siteAccess(ctx, r, members, membersErr)
+			left++
+		}
+	}
+	for _, r := range a.cfg.Roots {
+		if r.URL != "" {
+			deadline, _ := ctx.Deadline()
+			share, cancel := context.WithTimeout(ctx, time.Until(deadline)/time.Duration(left))
+			left--
+			found, code := a.siteAccess(share, r, members, membersErr)
+			cancel()
 			siteClasses = append(siteClasses, found...)
 			if code != "" {
 				errs = append(errs, rootError{Root: r.ID, Code: code})
@@ -541,6 +551,9 @@ func (a *agent) read(ctx context.Context, m message, t *transfer, frame func([]b
 		if err != nil {
 			return nil
 		}
+	}
+	if extra, _ := f.ReadAt(buffer[4:5], sent); extra > 0 {
+		return refuse("changed")
 	}
 	after, err := f.Info()
 	if err != nil || after.ID != before.ID || after.Size != before.Size || !after.Modified.Equal(before.Modified) {

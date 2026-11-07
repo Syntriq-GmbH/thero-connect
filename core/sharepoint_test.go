@@ -595,6 +595,11 @@ func walkSite(t *testing.T, a *agent, changes bool) sitePage {
 		}
 		result.deleted = append(result.deleted, page.Deleted...)
 		result.incomplete = append(result.incomplete, page.Incomplete...)
+		for _, prefix := range page.Incomplete {
+			if _, err := validPath(prefix); err != nil {
+				t.Errorf("incomplete %q is not a valid path", prefix)
+			}
+		}
 		if page.Cursor == "" {
 			return result
 		}
@@ -676,13 +681,26 @@ func TestClaims(t *testing.T) {
 		{5, "", 4, false},
 	}
 	for _, c := range cases {
-		if got := (principal{ID: c.id, Login: c.login, Type: c.kind}).matches(person, u); got != c.want {
+		grants := invert([]assignment{{Member: principal{ID: c.id, Login: c.login, Type: c.kind}, Mask: 1}})
+		if got := grants.mask(person, u) == 1; got != c.want {
 			t.Errorf("%d %q type %d matched %v", c.id, c.login, c.kind, got)
 		}
 	}
-	group := &scopeGrants{Assignments: []assignment{{Member: principal{ID: 50, Login: "Owners", Type: 8}, Members: []principal{{ID: 12, Login: `i:0#.w|corp\bob`, Type: 1}, {ID: 11, Login: `i:0#.w|corp\alice`, Type: 1}}, Mask: 3}}}
+	group := invert([]assignment{{Member: principal{ID: 50, Login: "Owners", Type: 8}, Members: []principal{{ID: 12, Login: `i:0#.w|corp\bob`, Type: 1}, {ID: 11, Login: `i:0#.w|corp\alice`, Type: 1}}, Mask: 3}})
 	if group.mask(person, u) != 3 || group.mask(person, siteUser{ID: 13}) != 0 {
 		t.Fatal("SharePoint group members match by row id")
+	}
+	nested := invert([]assignment{
+		{Member: principal{ID: 50, Login: "Owners", Type: 8}, Members: []principal{{ID: 60, Login: "Nested", Type: 8}, {ID: 61, Login: "c:0(.s|true", Type: -1}, {ID: 5, Login: "c:0+.w|s-1-5-21-1-2-3-2001", Type: 4}}, Mask: 4},
+		{Member: principal{ID: 11, Login: `i:0#.w|corp\alice`, Type: 1}, Mask: 1},
+		{Member: principal{ID: 7, Login: "c:0!.s|windows", Type: 4}, Mask: 16},
+		{Member: principal{ID: 11, Login: `i:0#.w|corp\alice`, Type: 1}, Members: []principal{{ID: 12, Type: 1}}, Mask: 32},
+	})
+	if got := nested.mask(person, u); got != 4|1|16|32 {
+		t.Fatalf("combined mask %b", got)
+	}
+	if got := nested.mask(Member{SIDs: []string{"s-1-5-21-1-2-3-1002"}}, siteUser{ID: 12}); got != 16 {
+		t.Fatalf("members of a non-group assignment matched: %b", got)
 	}
 }
 
@@ -701,12 +719,12 @@ func TestMasks(t *testing.T) {
 	}
 	u := siteUser{ID: 11}
 	for _, c := range cases {
-		grants := &scopeGrants{Assignments: []assignment{{Member: principal{ID: 11, Type: 1}, Mask: c.high<<32 | c.low}}}
+		grants := invert([]assignment{{Member: principal{ID: 11, Type: 1}, Mask: c.high<<32 | c.low}})
 		if got := grants.mask(Member{}, u)&need == need; got != c.want {
 			t.Errorf("%s gives %v", c.name, got)
 		}
 	}
-	if (&scopeGrants{}).mask(Member{}, siteUser{ID: 11, Admin: true})&need != need {
+	if invert(nil).mask(Member{}, siteUser{ID: 11, Admin: true})&need != need {
 		t.Error("site collection administrator lacks the need")
 	}
 	f, src, docs := basicFarm(t)
@@ -892,10 +910,15 @@ func TestReadOwnItems(t *testing.T) {
 		t.Fatal("item without author has a class")
 	}
 	f.update(func() { f.noRead = true })
+	selected := f.count("ReadSecurity")
 	walk = walkSite(t, a, false)
 	readers, _ = readersByPath(t, a, []string{aliceSID, bobSID, carolSID}, walk.entries)
-	if !slices.Equal(readers["Lists/Open/1_.000.md"], []int{0}) || f.count("ReadSecurity") == 0 {
+	if !slices.Equal(readers["Lists/Open/1_.000.md"], []int{0}) || f.count("ReadSecurity") != selected+1 {
 		t.Fatalf("lists without ReadSecurity are not owner only: %v", readers)
+	}
+	walkSite(t, a, false)
+	if _, code := readSite(a, walk.entries["Lists/Open/1_.000.md"]); code != "done" || f.count("ReadSecurity") != selected+1 {
+		t.Fatalf("ReadSecurity asked again after a 400: read %s, %d requests", code, f.count("ReadSecurity")-selected)
 	}
 }
 
@@ -1416,6 +1439,178 @@ func TestChanges(t *testing.T) {
 	}
 }
 
+func TestChangesRootWebFailure(t *testing.T) {
+	f, src, docs := basicFarm(t)
+	f.file(docs, "a.txt", "a")
+	other := f.list(f.root(), "Lists/Other", 100)
+	f.item(other, "Item", nil)
+	hidden := f.list(f.root(), "Hidden", 1)
+	f.update(func() { hidden.props["Hidden"] = true })
+	sub := f.web(f.root(), "teams", false)
+	f.file(f.list(sub, "Docs", 1), "t.txt", "t")
+	a := f.agent(src)
+	walkSite(t, a, false)
+	f.change(map[string]any{"WebId": f.root().id})
+	f.update(func() {
+		f.fault = func(r *http.Request) *farmFault {
+			if r.URL.Path == "/sites/hr/_api/web" {
+				return &farmFault{status: http.StatusInternalServerError}
+			}
+			return nil
+		}
+	})
+	got := walkSite(t, a, true)
+	slices.Sort(got.incomplete)
+	if got.code != "" || !slices.Equal(got.incomplete, []string{"Lists/Other", "Shared Documents", "teams/Docs"}) || len(got.deleted) != 0 {
+		t.Fatalf("failed root web re-walk: %+v", got)
+	}
+	if code := walkSite(t, a, true).code; code != "cursor" {
+		t.Fatalf("after a failed root web answered %s", code)
+	}
+}
+
+func TestDigestRenewed(t *testing.T) {
+	f, src, docs := basicFarm(t)
+	f.file(docs, "a.txt", "a")
+	a := f.agent(src)
+	walkSite(t, a, false)
+	a.sites.roots["intranet"].digest, a.sites.roots["intranet"].digestTo = "rejected", time.Now().Add(time.Hour)
+	f.file(docs, "b.txt", "b")
+	f.change(map[string]any{"ListId": docs.id, "ItemId": 2})
+	if got := walkSite(t, a, true); got.code != "" || len(got.entries) != 1 || f.count("contextinfo") != 1 || a.sites.roots["intranet"].digest != "digest-1" {
+		t.Fatalf("stale digest: %+v, %d digests", got, f.count("contextinfo"))
+	}
+	f.update(func() {
+		f.fault = func(r *http.Request) *farmFault {
+			if strings.HasSuffix(r.URL.Path, "getchanges") {
+				return &farmFault{status: http.StatusForbidden}
+			}
+			return nil
+		}
+	})
+	calls := f.count("getchanges")
+	if code := walkSite(t, a, true).code; code != "cursor" || f.count("contextinfo") != 2 || f.count("getchanges") != calls+2 {
+		t.Fatalf("refused change log answered %s after %d digests and %d calls", code, f.count("contextinfo"), f.count("getchanges")-calls)
+	}
+}
+
+func TestSnapshotDeadline(t *testing.T) {
+	f, src, docs := basicFarm(t)
+	for i := range 24 {
+		row := f.file(docs, fmt.Sprintf("f%02d.txt", i), "x")
+		f.update(func() {
+			row.props["HasUniqueRoleAssignments"] = true
+			f.roles[fmt.Sprintf("i:%s:%d", docs.id, row.id)] = []map[string]any{grantTo(3, domainUsers, 4, readHigh, readLow)}
+		})
+	}
+	a := f.agent(src)
+	walk := walkSite(t, a, false)
+	previous := accessTime
+	accessTime = 800 * time.Millisecond
+	t.Cleanup(func() { accessTime = previous })
+	f.update(func() {
+		f.delay = func(r *http.Request) time.Duration {
+			if strings.HasSuffix(r.URL.Path, "/roleassignments") {
+				return 100 * time.Millisecond
+			}
+			return 0
+		}
+	})
+	readers, errs := readersByPath(t, a, []string{aliceSID}, walk.entries)
+	granted := 0
+	for _, r := range readers {
+		granted += len(r)
+	}
+	if len(errs) != 0 || granted == 0 || granted == 24 || a.sites.roots["intranet"].snap != nil {
+		t.Fatalf("cut snapshot: %d readers, errors %v, cached %v", granted, errs, a.sites.roots["intranet"].snap != nil)
+	}
+	if f.count("/roleassignments") < 8 || f.count("/roleassignments") > 20 {
+		t.Fatalf("snapshot did not run in parallel within half the deadline: %d calls", f.count("/roleassignments"))
+	}
+	accessTime = 30 * time.Second
+	readers, _ = readersByPath(t, a, []string{aliceSID}, walk.entries)
+	granted = 0
+	for _, r := range readers {
+		granted += len(r)
+	}
+	if granted != 24 || a.sites.roots["intranet"].snap == nil {
+		t.Fatalf("complete snapshot gave %d readers", granted)
+	}
+}
+
+func TestAccessShares(t *testing.T) {
+	f, src, docs := basicFarm(t)
+	for i := range 12 {
+		row := f.file(docs, fmt.Sprintf("f%02d.txt", i), "x")
+		f.update(func() {
+			row.props["HasUniqueRoleAssignments"] = true
+			f.roles[fmt.Sprintf("i:%s:%d", docs.id, row.id)] = []map[string]any{grantTo(3, domainUsers, 4, readHigh, readLow)}
+		})
+	}
+	a := f.agent(src)
+	a.cfg.Roots = append(a.cfg.Roots, root{ID: "second", URL: a.cfg.Roots[0].URL, SPN: a.cfg.Roots[0].SPN})
+	walkSite(t, a, false)
+	for cursor := a.walk(message{Type: "walk", ID: 1, Root: "second"}).(pageMessage).Cursor; cursor != ""; {
+		cursor = a.walk(message{Type: "walk", ID: 1, Root: "second", Cursor: cursor}).(pageMessage).Cursor
+	}
+	previous := accessTime
+	accessTime = 600 * time.Millisecond
+	t.Cleanup(func() { accessTime = previous })
+	f.update(func() {
+		f.delay = func(r *http.Request) time.Duration {
+			if strings.Contains(r.URL.Path, "getusereffectivepermissions") {
+				return 150 * time.Millisecond
+			}
+			return 0
+		}
+	})
+	rights := a.access(message{Type: "access", ID: 2, SIDs: []string{aliceSID, bobSID}}).(rightsMessage)
+	rootOf := map[string]string{}
+	for _, id := range []string{"intranet", "second"} {
+		for _, ref := range a.sites.roots[id].base.paths {
+			rootOf[ref.entry.Class] = id
+		}
+	}
+	perRoot := map[string]int{}
+	for _, c := range rights.Classes {
+		perRoot[rootOf[c.Class]] += len(c.Readers)
+	}
+	if len(rights.Errors) != 0 || perRoot["intranet"] == 0 || perRoot["second"] == 0 {
+		t.Fatalf("the first root used the whole deadline: readers %v, errors %v", perRoot, rights.Errors)
+	}
+}
+
+func TestCellRefresh(t *testing.T) {
+	f, src, docs := basicFarm(t)
+	f.file(docs, "a.txt", "a")
+	a := f.agent(src)
+	walk := walkSite(t, a, false)
+	start := time.Now()
+	a.now = func() time.Time { return start }
+	readersByPath(t, a, []string{aliceSID}, walk.entries)
+	checks := f.count("getusereffectivepermissions")
+	a.now = func() time.Time { return start.Add(cellRefresh - time.Second) }
+	readersByPath(t, a, []string{aliceSID}, walk.entries)
+	if f.count("getusereffectivepermissions") != checks {
+		t.Fatal("a young cell was checked again")
+	}
+	a.now = func() time.Time { return start.Add(cellRefresh) }
+	readers, _ := readersByPath(t, a, []string{aliceSID}, walk.entries)
+	if !slices.Equal(readers["Shared Documents/a.txt"], []int{0}) || f.count("getusereffectivepermissions") != checks+1 {
+		t.Fatalf("an old cell was not refreshed: readers %v", readers)
+	}
+	for _, c := range a.sites.cells {
+		if !c.at.Equal(start.Add(cellRefresh)) {
+			t.Fatalf("cell stamped %v", c.at)
+		}
+	}
+	a.now = func() time.Time { return start.Add(cellLife) }
+	readersByPath(t, a, []string{aliceSID}, walk.entries)
+	if f.count("getusereffectivepermissions") != checks+1 {
+		t.Fatal("a refreshed cell expired with its first answer")
+	}
+}
+
 func TestChangesCommit(t *testing.T) {
 	f, src, docs := basicFarm(t)
 	f.file(docs, "a.txt", "a")
@@ -1524,6 +1719,10 @@ func TestSiteRead(t *testing.T) {
 	f.update(func() { current.content = content[:len(content)-3] })
 	if _, code := readSite(a, walk.entries["Shared Documents/current.txt"]); code != "changed" {
 		t.Fatalf("short body answered %s", code)
+	}
+	f.update(func() { current.content = content + "tail" })
+	if _, code := readSite(a, walk.entries["Shared Documents/current.txt"]); code != "changed" {
+		t.Fatalf("long body answered %s", code)
 	}
 	a.cfg.Limits.ReadWindow = "00:00-00:00"
 	if _, code := readSite(a, walk.entries["Lists/Tickets/1_.000.md"]); code != "limit" {

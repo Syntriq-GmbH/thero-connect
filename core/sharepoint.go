@@ -31,6 +31,7 @@ const (
 	need         = 0x31021
 	fullMask     = 0x7FFFFFFFFFFFFFFF
 	cellLife     = 840 * time.Second
+	cellRefresh  = 540 * time.Second
 	snapshotLife = 240 * time.Second
 	fullBusy     = 10 * time.Minute
 	maxBody      = 64 << 20
@@ -115,7 +116,7 @@ type wireRow struct {
 		TimeLastModified string
 	}
 	AttachmentFiles []struct{ FileName, ServerRelativeUrl string }
-	values          map[string]json.RawMessage
+	markdown        int64
 }
 
 type wireChange struct {
@@ -188,6 +189,7 @@ type siteRoot struct {
 	digest   string
 	digestTo time.Time
 	snap     *snapshot
+	noRead   bool
 }
 
 type cell struct {
@@ -198,6 +200,7 @@ type cell struct {
 type sites struct {
 	src    Source
 	client *http.Client
+	stream *http.Client
 	mu     sync.Mutex
 	roots  map[string]*siteRoot
 	cells  map[string]cell
@@ -222,14 +225,16 @@ type assignment struct {
 }
 
 type scopeGrants struct {
-	Assignments []assignment
-	hash        string
+	hash  string
+	base  uint64
+	users map[int64]uint64
+	sids  map[string]uint64
 }
 
 type snapshot struct {
 	base   *baseline
 	at     time.Time
-	users  []siteUser
+	users  map[string][]siteUser
 	scopes map[string]*scopeGrants
 }
 
@@ -245,7 +250,13 @@ func newSites(src Source) *sites {
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
 	refuseRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &sites{src: src, client: &http.Client{Transport: transport, CheckRedirect: refuseRedirect}, roots: map[string]*siteRoot{}, cells: map[string]cell{}}
+	return &sites{
+		src:    src,
+		client: &http.Client{Transport: transport, CheckRedirect: refuseRedirect},
+		stream: &http.Client{Transport: transport.Clone(), CheckRedirect: refuseRedirect},
+		roots:  map[string]*siteRoot{},
+		cells:  map[string]cell{},
+	}
 }
 
 func sitePath(r root) string {
@@ -342,7 +353,7 @@ func (s *sites) do(ctx context.Context, r root, method, requestPath string, body
 			return nil, err
 		}
 	}
-	waits, rejected := 0, false
+	waits, rejected, redigested := 0, false, false
 	for {
 		req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
 		if err != nil || !s.allowed(r, req) {
@@ -363,7 +374,11 @@ func (s *sites) do(ctx context.Context, r root, method, requestPath string, body
 				req.Header.Set("X-RequestDigest", digest)
 			}
 		}
-		resp, err := s.client.Do(req)
+		client := s.client
+		if strings.HasSuffix(decoded, "/$value") {
+			client = s.stream
+		}
+		resp, err := client.Do(req)
 		if err != nil {
 			return nil, s.failed(r, fmt.Errorf("%w: %v", ErrUnavailable, err))
 		}
@@ -383,6 +398,15 @@ func (s *sites) do(ctx context.Context, r root, method, requestPath string, body
 			return nil, s.failed(r, fmt.Errorf("%w: Kerberos ticket rejected for %s; offered: %s; check SPN, clock and Extended Protection", ErrUnavailable, r.SPN, strings.Join(resp.Header.Values("WWW-Authenticate"), ", ")))
 		case status == http.StatusForbidden && resp.Header.Get("X-FORMS_BASED_AUTH_REQUIRED") != "":
 			return nil, s.failed(r, fmt.Errorf("%w: zone requires forms login", ErrUnavailable))
+		case status == http.StatusForbidden && digest != "" && !redigested:
+			redigested = true
+			s.mu.Lock()
+			s.state(r).digest = ""
+			s.mu.Unlock()
+			if digest, err = s.digest(ctx, r); err != nil {
+				return nil, err
+			}
+			continue
 		case status == http.StatusForbidden:
 			return nil, s.failed(r, ErrDenied)
 		case status == http.StatusNotFound:
@@ -457,11 +481,23 @@ func (s *sites) lists(ctx context.Context, r root, web, id string, target any) e
 	if id != "" {
 		base += "(guid'" + id + "')"
 	}
+	reduced := base + "?$select=" + strings.Replace(listSelect, ",ReadSecurity", "", 1) + "&$expand=RootFolder"
+	s.mu.Lock()
+	noRead := s.state(r).noRead
+	s.mu.Unlock()
+	if noRead {
+		return s.get(ctx, r, http.MethodGet, reduced, nil, target)
+	}
 	err := s.get(ctx, r, http.MethodGet, base+"?$select="+listSelect+"&$expand=RootFolder", nil, target)
 	if !errors.Is(err, errBadRequest) {
 		return err
 	}
-	return s.get(ctx, r, http.MethodGet, base+"?$select="+strings.Replace(listSelect, ",ReadSecurity", "", 1)+"&$expand=RootFolder", nil, target)
+	if err = s.get(ctx, r, http.MethodGet, reduced, nil, target); err == nil {
+		s.mu.Lock()
+		s.state(r).noRead = true
+		s.mu.Unlock()
+	}
+	return err
 }
 
 func validToken(token, site string) bool {
@@ -600,7 +636,7 @@ func describe(b *baseline, l *spList, row wireRow) (spEntry, bool) {
 		e.URL = link(b.origin, row.FileRef, "")
 	} else {
 		e.Title = titleOf(row, e.Item)
-		e.Size = int64(len(render(e.Title, l.Fields, row.values)))
+		e.Size = row.markdown
 		e.URL = link(b.origin, l.Form, "?ID="+strconv.FormatInt(e.Item, 10))
 	}
 	e.Modified = millis(stamp)
@@ -721,8 +757,10 @@ func (x *spRun) get(requestPath string, target any) error {
 }
 
 func (x *spRun) fail(rel string) {
-	x.incomplete = append(x.incomplete, rel)
 	x.b.partial = true
+	if _, err := validPath(rel); err == nil {
+		x.incomplete = append(x.incomplete, rel)
+	}
 }
 
 func (x *spRun) keep(web string) {
@@ -929,7 +967,9 @@ func (x *spRun) items(l *spList, web spWeb) error {
 				continue
 			}
 			if !l.Library {
-				json.Unmarshal(raw, &row.values)
+				var values map[string]json.RawMessage
+				json.Unmarshal(raw, &values)
+				row.markdown = int64(len(render(titleOf(row, last), l.Fields, values)))
 			}
 			rows = append(rows, row)
 		}
@@ -1109,6 +1149,15 @@ func (x *spRun) changes() error {
 		}
 		if err != nil {
 			x.fail(rel)
+			if web.Parent != "" {
+				continue
+			}
+			for _, list := range slices.Sorted(maps.Keys(old.lists)) {
+				if !old.lists[list].Skipped {
+					rel, _ = x.b.relative(old.lists[list].Root)
+					x.fail(rel)
+				}
+			}
 			continue
 		}
 		if strings.ToLower(wire.ID) != id {
@@ -1292,40 +1341,47 @@ func (a *agent) siteWalk(m message, r root) any {
 	return page
 }
 
-func (p principal) matches(person Member, u siteUser) bool {
-	login := strings.ToLower(p.Login)
-	switch {
-	case p.Type < 0 || p.Type == 8:
-		return false
-	case everyone[login]:
-		return true
-	case p.Type == 1:
-		return p.ID == u.ID
-	case p.Type == 4:
-		sid, ok := strings.CutPrefix(login, "c:0+.w|")
-		return ok && slices.Contains(person.SIDs, sid)
+func invert(assignments []assignment) *scopeGrants {
+	g := &scopeGrants{users: map[int64]uint64{}, sids: map[string]uint64{}}
+	add := func(p principal, mask uint64) {
+		login := strings.ToLower(p.Login)
+		sid, claim := strings.CutPrefix(login, "c:0+.w|")
+		switch {
+		case p.Type < 0 || p.Type == 8:
+		case everyone[login]:
+			g.base |= mask
+		case p.Type == 1:
+			g.users[p.ID] |= mask
+		case p.Type == 4 && claim:
+			g.sids[sid] |= mask
+		}
 	}
-	return false
+	for _, item := range assignments {
+		add(item.Member, item.Mask)
+		if item.Member.Type == 8 {
+			for _, member := range item.Members {
+				add(member, item.Mask)
+			}
+		}
+	}
+	return g
 }
 
 func (g *scopeGrants) mask(person Member, u siteUser) uint64 {
 	if u.Admin {
 		return fullMask
 	}
-	var mask uint64
-	for _, item := range g.Assignments {
-		member := func(p principal) bool { return p.matches(person, u) }
-		if member(item.Member) || item.Member.Type == 8 && slices.ContainsFunc(item.Members, member) {
-			mask |= item.Mask
-		}
+	mask := g.base | g.users[u.ID]
+	for _, sid := range person.SIDs {
+		mask |= g.sids[sid]
 	}
 	return mask
 }
 
 func (snap *snapshot) verified(person Member) (siteUser, bool) {
 	var found []siteUser
-	for _, u := range snap.users {
-		if person.Login != "" && strings.ToLower(u.Login) == person.Login && u.SID == person.SID {
+	for _, u := range snap.users[person.Login] {
+		if u.SID == person.SID {
 			found = append(found, u)
 		}
 	}
@@ -1360,7 +1416,7 @@ func (s *sites) members(ctx context.Context, r root, group int64) []principal {
 	return members
 }
 
-func (s *sites) grants(ctx context.Context, r root, b *baseline, scope string, admins []int64, groups map[int64][]principal) (*scopeGrants, error) {
+func (s *sites) grants(ctx context.Context, r root, b *baseline, scope string, admins []int64, groups *sync.Map) (*scopeGrants, error) {
 	if web, ok := strings.CutPrefix(scope, "w:"); ok {
 		var identity struct {
 			ID string `json:"Id"`
@@ -1385,7 +1441,7 @@ func (s *sites) grants(ctx context.Context, r root, b *baseline, scope string, a
 	if err := s.get(ctx, r, http.MethodGet, b.scopePath(scope)+"/roleassignments?$expand=Member,RoleDefinitionBindings&$select=Member/Id,Member/LoginName,Member/PrincipalType,RoleDefinitionBindings/BasePermissions", nil, &wire); err != nil {
 		return nil, err
 	}
-	g := &scopeGrants{}
+	var assignments []assignment
 	for _, item := range wire.Value {
 		if item.Member.ID == nil || item.Member.PrincipalType == nil {
 			return nil, errors.New("invalid role assignment")
@@ -1399,20 +1455,20 @@ func (s *sites) grants(ctx context.Context, r root, b *baseline, scope string, a
 			granted.Mask |= uint64(*bits.High)<<32 | uint64(*bits.Low)
 		}
 		if granted.Member.Type == 8 {
-			members, known := groups[granted.Member.ID]
+			members, known := groups.Load(granted.Member.ID)
 			if !known {
-				members = s.members(ctx, r, granted.Member.ID)
-				groups[granted.Member.ID] = members
+				members, _ = groups.LoadOrStore(granted.Member.ID, s.members(ctx, r, granted.Member.ID))
 			}
-			granted.Members = members
+			granted.Members = members.([]principal)
 		}
-		g.Assignments = append(g.Assignments, granted)
+		assignments = append(assignments, granted)
 	}
 	data, _ := json.Marshal(struct {
 		Assignments []assignment
 		Admins      []int64
-	}{g.Assignments, admins})
+	}{assignments, admins})
 	sum := sha256.Sum256(data)
+	g := invert(assignments)
 	g.hash = hex.EncodeToString(sum[:])
 	return g, nil
 }
@@ -1447,27 +1503,49 @@ func (s *sites) snapshot(ctx context.Context, r root, b *baseline, scopes []stri
 	if err := s.get(ctx, r, http.MethodGet, apiPath(sitePath(r), "web/siteusers?$select=Id,LoginName,IsSiteAdmin,UserId"), nil, &users); err != nil {
 		return nil, err
 	}
-	snap := &snapshot{base: b, at: now, scopes: map[string]*scopeGrants{}}
+	snap := &snapshot{base: b, at: now, users: map[string][]siteUser{}, scopes: map[string]*scopeGrants{}}
 	admins := []int64{}
 	for _, row := range users.Value {
 		if row.ID == nil || row.IsSiteAdmin == nil || row.UserID == nil || row.UserID.NameID == "" || row.LoginName == "" {
 			continue
 		}
-		snap.users = append(snap.users, siteUser{ID: int64(*row.ID), Login: row.LoginName, SID: strings.ToLower(row.UserID.NameID), Admin: *row.IsSiteAdmin})
+		login := strings.ToLower(row.LoginName)
+		snap.users[login] = append(snap.users[login], siteUser{ID: int64(*row.ID), Login: row.LoginName, SID: strings.ToLower(row.UserID.NameID), Admin: *row.IsSiteAdmin})
 		if *row.IsSiteAdmin {
 			admins = append(admins, int64(*row.ID))
 		}
 	}
 	slices.Sort(admins)
-	groups := map[int64][]principal{}
-	for _, scope := range scopes {
-		if grants, err := s.grants(ctx, r, b, scope, admins, groups); err == nil {
-			snap.scopes[scope] = grants
-		}
+	var groups sync.Map
+	var mu sync.Mutex
+	jobs := make(chan string)
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			for scope := range jobs {
+				grants, err := s.grants(ctx, r, b, scope, admins, &groups)
+				if err != nil {
+					continue
+				}
+				mu.Lock()
+				snap.scopes[scope] = grants
+				mu.Unlock()
+			}
+		})
 	}
-	s.mu.Lock()
-	st.snap = snap
-	s.mu.Unlock()
+	for _, scope := range scopes {
+		if ctx.Err() != nil {
+			break
+		}
+		jobs <- scope
+	}
+	close(jobs)
+	wg.Wait()
+	if ctx.Err() == nil {
+		s.mu.Lock()
+		st.snap = snap
+		s.mu.Unlock()
+	}
 	return snap, nil
 }
 
@@ -1522,7 +1600,10 @@ func (a *agent) siteAccess(ctx context.Context, r root, members []Member, member
 	for _, c := range registry {
 		scopes[c.scope] = true
 	}
-	snap, err := s.snapshot(ctx, r, b, slices.Sorted(maps.Keys(scopes)), now)
+	deadline, _ := ctx.Deadline()
+	snapCtx, cancel := context.WithTimeout(ctx, time.Until(deadline)/2)
+	snap, err := s.snapshot(snapCtx, r, b, slices.Sorted(maps.Keys(scopes)), now)
+	cancel()
 	if errors.Is(err, ErrDenied) {
 		return report("denied")
 	}
@@ -1535,9 +1616,12 @@ func (a *agent) siteAccess(ctx context.Context, r root, members []Member, member
 	}
 	users := make([]siteUser, len(members))
 	granted := make([]map[string]bool, len(members))
-	var checks []check
+	var checks, refresh []check
 	cached := 0
 	for k, person := range members {
+		if ctx.Err() != nil {
+			break
+		}
 		u, ok := snap.verified(person)
 		if !ok {
 			continue
@@ -1553,12 +1637,15 @@ func (a *agent) siteAccess(ctx context.Context, r root, members []Member, member
 			s.mu.Lock()
 			hit, found := s.cells[key]
 			s.mu.Unlock()
-			if found {
-				granted[k][scope] = hit.mask&need == need
-				cached++
+			if !found {
+				checks = append(checks, check{k, scope, key, u.Login})
 				continue
 			}
-			checks = append(checks, check{k, scope, key, u.Login})
+			granted[k][scope] = hit.mask&need == need
+			cached++
+			if now.Sub(hit.at) >= cellRefresh {
+				refresh = append(refresh, check{k, scope, key, u.Login})
+			}
 		}
 	}
 	var mu sync.Mutex
@@ -1584,11 +1671,12 @@ func (a *agent) siteAccess(ctx context.Context, r root, members []Member, member
 				answered++
 				mu.Unlock()
 				s.mu.Lock()
-				s.cells[c.key] = cell{mask: mask, at: now}
+				s.cells[c.key] = cell{mask: mask, at: a.now()}
 				s.mu.Unlock()
 			}
 		})
 	}
+	checks = append(checks, refresh...)
 	for _, c := range checks {
 		jobs <- c
 	}
@@ -1652,10 +1740,12 @@ func (f *siteFile) Info() (FileInfo, error) {
 		return FileInfo{}, err
 	}
 	var row wireRow
-	if json.Unmarshal(raw, &row) != nil {
+	var values map[string]json.RawMessage
+	if json.Unmarshal(raw, &row) != nil || json.Unmarshal(raw, &values) != nil {
 		return changed, nil
 	}
-	json.Unmarshal(raw, &row.values)
+	text := render(titleOf(row, e.Item), l.Fields, values)
+	row.markdown = int64(len(text))
 	now, published := describe(f.b, &current, row)
 	if !published || now.Sig != e.Sig {
 		return changed, nil
@@ -1674,7 +1764,7 @@ func (f *siteFile) Info() (FileInfo, error) {
 		}
 		size, modified = int64(*props.Length), millis(props.TimeLastModified)
 	} else if !l.Library {
-		f.text = []byte(render(now.Title, l.Fields, row.values))
+		f.text = []byte(text)
 	}
 	if size != e.Size || modified != e.Modified {
 		return changed, nil
