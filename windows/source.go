@@ -4,11 +4,14 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf16"
 	"unsafe"
 
 	"github.com/Syntriq-GmbH/thero-connect/core"
@@ -84,6 +87,37 @@ type authzAccessReply struct {
 	errors                *uint32
 }
 
+type authIdentity struct {
+	version           uint32
+	length            uint32
+	user              *uint16
+	userLength        uint32
+	domain            *uint16
+	domainLength      uint32
+	password          *uint16
+	passwordLength    uint32
+	flags             uint32
+	packageList       *uint16
+	packageListLength uint32
+}
+
+type secHandle struct {
+	lower uintptr
+	upper uintptr
+}
+
+type secBuffer struct {
+	size       uint32
+	bufferType uint32
+	buffer     *byte
+}
+
+type secBufferDesc struct {
+	version uint32
+	count   uint32
+	buffers *secBuffer
+}
+
 type berval struct {
 	length uint32
 	value  *byte
@@ -97,6 +131,18 @@ const (
 	ldapAuthNegotiate      = 0x0486
 	ldapScopeBase          = 0
 	ldapScopeSubtree       = 2
+	ldapNoSuchObject       = 0x20
+	secpkgCredOutbound     = 2
+	authIdentityVersion    = 0x200
+	authIdentityUnicode    = 2
+	iscReqAllocateMemory   = 0x100
+	iscReqConnection       = 0x800
+	iscRetDelegate         = 0x1
+	negotiateFlags         = iscReqAllocateMemory | iscReqConnection
+	securityNativeDrep     = 0x10
+	secbufferToken         = 2
+	secEOK                 = 0
+	secIContinueNeeded     = 0x00090312
 )
 
 var (
@@ -120,6 +166,17 @@ var (
 	procLdapValueFreeLen                     = wldap32.NewProc("ldap_value_free_len")
 	procLdapMsgFree                          = wldap32.NewProc("ldap_msgfree")
 	procLdapUnbind                           = wldap32.NewProc("ldap_unbind")
+	secur32                                  = windows.NewLazySystemDLL("secur32.dll")
+	procAcquireCredentialsHandle             = secur32.NewProc("AcquireCredentialsHandleW")
+	procInitializeSecurityContext            = secur32.NewProc("InitializeSecurityContextW")
+	procFreeContextBuffer                    = secur32.NewProc("FreeContextBuffer")
+	procDeleteSecurityContext                = secur32.NewProc("DeleteSecurityContext")
+	procFreeCredentialsHandle                = secur32.NewProc("FreeCredentialsHandle")
+	ldapFilterValue                          = strings.NewReplacer(`\`, `\5c`, `*`, `\2a`, `(`, `\28`, `)`, `\29`, "\x00", `\00`)
+	domainNames                              struct {
+		sync.Mutex
+		domain, netbios string
+	}
 )
 
 func sentinel(err error) error {
@@ -330,12 +387,11 @@ func (windowsSource) Share(root string) ([]byte, error) {
 	return securityBytes(relative), nil
 }
 
-func (windowsSource) Accounts(filter string) ([]core.Account, error) {
+func ldapOpen() (uintptr, string, string, error) {
 	connection, _, err := procLdapInit.Call(0, 389)
 	if connection == 0 {
-		return nil, fmt.Errorf("%w: ldap init: %v", core.ErrUnavailable, err)
+		return 0, "", "", fmt.Errorf("%w: ldap init: %v", core.ErrUnavailable, err)
 	}
-	defer procLdapUnbind.Call(connection)
 	version, off, on := uint32(3), uint32(0), uint32(1)
 	options := []struct {
 		option uintptr
@@ -343,20 +399,31 @@ func (windowsSource) Accounts(filter string) ([]core.Account, error) {
 	}{{ldapOptProtocolVersion, &version}, {ldapOptReferrals, &off}, {ldapOptSign, &on}, {ldapOptEncrypt, &on}}
 	for _, item := range options {
 		if code, _, _ := procLdapSetOption.Call(connection, item.option, uintptr(unsafe.Pointer(item.value))); code != 0 {
-			return nil, fmt.Errorf("%w: ldap option %#x: %d", core.ErrUnavailable, item.option, code)
+			procLdapUnbind.Call(connection)
+			return 0, "", "", fmt.Errorf("%w: ldap option %#x: %d", core.ErrUnavailable, item.option, code)
 		}
 	}
 	if code, _, _ := procLdapBind.Call(connection, 0, 0, ldapAuthNegotiate); code != 0 {
-		return nil, fmt.Errorf("%w: ldap bind: %d", core.ErrUnavailable, code)
+		procLdapUnbind.Call(connection)
+		return 0, "", "", fmt.Errorf("%w: ldap bind: %d", core.ErrUnavailable, code)
 	}
-	rootDSE, err := ldapSearch(connection, "", ldapScopeBase, "(objectClass=*)", []string{"defaultNamingContext"})
+	rootDSE, err := ldapSearch(connection, "", ldapScopeBase, "(objectClass=*)", []string{"defaultNamingContext", "configurationNamingContext"})
+	if err == nil && (len(rootDSE) != 1 || len(rootDSE[0]["defaultNamingContext"]) != 1 || len(rootDSE[0]["configurationNamingContext"]) != 1) {
+		err = fmt.Errorf("%w: no naming contexts", core.ErrUnavailable)
+	}
+	if err != nil {
+		procLdapUnbind.Call(connection)
+		return 0, "", "", err
+	}
+	return connection, string(rootDSE[0]["defaultNamingContext"][0]), string(rootDSE[0]["configurationNamingContext"][0]), nil
+}
+
+func (windowsSource) Accounts(filter string) ([]core.Account, error) {
+	connection, base, _, err := ldapOpen()
 	if err != nil {
 		return nil, err
 	}
-	if len(rootDSE) == 0 || len(rootDSE[0]["defaultNamingContext"]) == 0 {
-		return nil, fmt.Errorf("%w: no default naming context", core.ErrUnavailable)
-	}
-	base := string(rootDSE[0]["defaultNamingContext"][0])
+	defer procLdapUnbind.Call(connection)
 	results, err := ldapSearch(connection, base, ldapScopeSubtree, filter, core.AccountAttributes)
 	if err != nil {
 		return nil, err
@@ -390,6 +457,9 @@ func ldapSearch(connection uintptr, base string, scope uintptr, filter string, a
 	code, _, _ := procLdapSearch.Call(connection, uintptr(unsafe.Pointer(basePointer)), scope, uintptr(unsafe.Pointer(filterPointer)), uintptr(unsafe.Pointer(&names[0])), 0, uintptr(unsafe.Pointer(&result)))
 	if result != 0 {
 		defer procLdapMsgFree.Call(result)
+	}
+	if code == ldapNoSuchObject {
+		return nil, nil
 	}
 	if code != 0 {
 		return nil, fmt.Errorf("%w: ldap search: %d", core.ErrUnavailable, code)
@@ -477,11 +547,103 @@ func (windowsSource) Allowed(server string, sids []string, descriptors [][]byte)
 }
 
 func (windowsSource) Members(sids []string) ([]core.Member, error) {
-	return nil, core.ErrUnavailable
+	if len(sids) == 0 {
+		return nil, nil
+	}
+	connection, base, configuration, err := ldapOpen()
+	if err != nil {
+		return nil, err
+	}
+	defer procLdapUnbind.Call(connection)
+	domainNames.Lock()
+	domain, netbios := domainNames.domain, domainNames.netbios
+	domainNames.Unlock()
+	if domain == "" || netbios == "" {
+		self, err := ldapSearch(connection, base, ldapScopeBase, "(objectClass=*)", []string{"objectSid"})
+		if err != nil {
+			return nil, err
+		}
+		if len(self) != 1 || len(self[0]["objectSid"]) != 1 {
+			return nil, fmt.Errorf("%w: no domain sid", core.ErrUnavailable)
+		}
+		if domain, _, err = core.SIDString(self[0]["objectSid"][0]); err != nil {
+			return nil, fmt.Errorf("%w: domain sid: %v", core.ErrUnavailable, err)
+		}
+		partitions, err := ldapSearch(connection, "CN=Partitions,"+configuration, ldapScopeSubtree, "(&(objectClass=crossRef)(nCName="+ldapFilterValue.Replace(base)+"))", []string{"nETBIOSName"})
+		if err != nil {
+			return nil, err
+		}
+		if len(partitions) != 1 || len(partitions[0]["nETBIOSName"]) != 1 || len(partitions[0]["nETBIOSName"][0]) == 0 {
+			return nil, fmt.Errorf("%w: no netbios name for %s", core.ErrUnavailable, base)
+		}
+		netbios = string(partitions[0]["nETBIOSName"][0])
+		domainNames.Lock()
+		domainNames.domain, domainNames.netbios = domain, netbios
+		domainNames.Unlock()
+	}
+	members := make([]core.Member, len(sids))
+	for i, sid := range sids {
+		if !core.InDomain(sid, domain) || strings.ContainsFunc(sid[len(domain)+1:], func(r rune) bool { return r < '0' || r > '9' }) {
+			continue
+		}
+		results, err := ldapSearch(connection, "<SID="+sid+">", ldapScopeBase, "(objectClass=*)", core.MemberAttributes)
+		if err != nil {
+			return nil, err
+		}
+		if len(results) != 1 {
+			continue
+		}
+		if member, ok := core.MemberOf(results[0], domain, netbios); ok && member.SID == strings.ToLower(sid) {
+			members[i] = member
+		}
+	}
+	return members, nil
+}
+
+func negotiated(status, attributes uint32, spn string) error {
+	if status != secEOK && status != secIContinueNeeded {
+		return fmt.Errorf("%w: negotiate %s: status %#x", core.ErrUnavailable, spn, status)
+	}
+	if attributes&iscRetDelegate != 0 {
+		return fmt.Errorf("%w: negotiate %s: delegation granted", core.ErrUnavailable, spn)
+	}
+	return nil
 }
 
 func (windowsSource) Negotiate(spn string) (string, error) {
-	return "", core.ErrUnavailable
+	target, err := windows.UTF16PtrFromString(spn)
+	if err != nil {
+		return "", fmt.Errorf("%w: negotiate %s: %v", core.ErrUnavailable, spn, err)
+	}
+	identity := authIdentity{version: authIdentityVersion, flags: authIdentityUnicode, packageList: &utf16.Encode([]rune("Kerberos\x00"))[0], packageListLength: 8}
+	identity.length = uint32(unsafe.Sizeof(identity))
+	var credentials secHandle
+	var expiry int64
+	status, _, _ := procAcquireCredentialsHandle.Call(0, uintptr(unsafe.Pointer(&utf16.Encode([]rune("Negotiate\x00"))[0])), secpkgCredOutbound, 0, uintptr(unsafe.Pointer(&identity)), 0, 0, uintptr(unsafe.Pointer(&credentials)), uintptr(unsafe.Pointer(&expiry)))
+	if uint32(status) != secEOK {
+		return "", fmt.Errorf("%w: negotiate %s: credentials status %#x", core.ErrUnavailable, spn, uint32(status))
+	}
+	defer procFreeCredentialsHandle.Call(uintptr(unsafe.Pointer(&credentials)))
+	var context secHandle
+	var attributes uint32
+	buffer := secBuffer{bufferType: secbufferToken}
+	output := secBufferDesc{count: 1, buffers: &buffer}
+	status, _, _ = procInitializeSecurityContext.Call(uintptr(unsafe.Pointer(&credentials)), 0, uintptr(unsafe.Pointer(target)), negotiateFlags, 0, securityNativeDrep, 0, 0, uintptr(unsafe.Pointer(&context)), uintptr(unsafe.Pointer(&output)), uintptr(unsafe.Pointer(&attributes)), uintptr(unsafe.Pointer(&expiry)))
+	var token []byte
+	if buffer.buffer != nil {
+		token = bytes.Clone(unsafe.Slice(buffer.buffer, buffer.size))
+		procFreeContextBuffer.Call(uintptr(unsafe.Pointer(buffer.buffer)))
+	}
+	if uint32(status) == secEOK || uint32(status) == secIContinueNeeded {
+		defer procDeleteSecurityContext.Call(uintptr(unsafe.Pointer(&context)))
+	}
+	if err := negotiated(uint32(status), attributes, spn); err != nil {
+		return "", err
+	}
+	if err := core.KerberosToken(token); err != nil {
+		return "", fmt.Errorf("%w: negotiate %s", err, spn)
+	}
+	return base64.StdEncoding.EncodeToString(token), nil
 }
 
 func (windowsSource) Open(root, rel string) (core.File, error) {
