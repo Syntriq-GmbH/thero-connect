@@ -418,7 +418,7 @@ func (s *linuxSource) members(conn *ldap.Conn, base string, sids []string) ([]co
 	}
 	members := make([]core.Member, len(sids))
 	for k, sid := range sids {
-		if !core.InDomain(sid, domain) {
+		if !core.InDomain(sid, domain) || strings.ContainsFunc(sid[len(domain)+1:], func(r rune) bool { return r < '0' || r > '9' }) {
 			continue
 		}
 		result, err := conn.Search(ldap.NewSearchRequest("<SID="+sid+">", ldap.ScopeBaseObject, ldap.NeverDerefAliases, 0, 30, false, "(objectClass=*)", core.MemberAttributes, nil))
@@ -428,8 +428,11 @@ func (s *linuxSource) members(conn *ldap.Conn, base string, sids []string) ([]co
 		if err != nil {
 			return unavailable(fmt.Errorf("member %s: %v", sid, err))
 		}
-		if len(result.Entries) == 1 {
-			members[k], _ = core.MemberOf(valuesOf(result.Entries[0], core.MemberAttributes), domain, netbios)
+		if len(result.Entries) != 1 {
+			continue
+		}
+		if member, ok := core.MemberOf(valuesOf(result.Entries[0], core.MemberAttributes), domain, netbios); ok && member.SID == strings.ToLower(sid) {
+			members[k] = member
 		}
 	}
 	return members, nil

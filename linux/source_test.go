@@ -956,9 +956,10 @@ func TestMembers(t *testing.T) {
 	answers["<SID="+testDomain+"-1107>"] = directoryAnswer{entries: []map[string][][]byte{object("1107", "top", "group")}}
 	answers["<SID="+testDomain+"-1108>"] = directoryAnswer{entries: []map[string][][]byte{object("1108", "top", "person", "organizationalPerson", "user", "computer")}}
 	answers["<SID="+testDomain+"-1109>"] = directoryAnswer{}
+	answers["<SID="+testDomain+"-1110>"] = directoryAnswer{entries: []map[string][][]byte{object("1105", "top", "person", "organizationalPerson", "user")}}
 	conn, asked := fakeDirectory(t, answers)
 	s := &linuxSource{}
-	sids := []string{testDomain + "-1105", testDomain + "-1106", testDomain + "-1107", testDomain + "-1108", testDomain + "-1109", testMember + "-1105", "S-1-5-32-544", testDomain}
+	sids := []string{testDomain + "-1105", testDomain + "-1106", testDomain + "-1107", testDomain + "-1108", testDomain + "-1109", testMember + "-1105", "S-1-5-32-544", testDomain, testDomain + "-1110", testDomain + "-11a5", testDomain + "-+1105"}
 	members, err := s.members(conn, base, sids)
 	if err != nil {
 		t.Fatal(err)
@@ -970,7 +971,7 @@ func TestMembers(t *testing.T) {
 		t.Fatalf("members %+v", members)
 	}
 	first := []string{base + " (objectClass=*)", " (objectClass=*)", crossRef}
-	for _, rid := range []string{"1105", "1106", "1107", "1108", "1109"} {
+	for _, rid := range []string{"1105", "1106", "1107", "1108", "1109", "1110"} {
 		first = append(first, "<SID="+testDomain+"-"+rid+"> (objectClass=*)")
 	}
 	if !slices.Equal(*asked, first) {
