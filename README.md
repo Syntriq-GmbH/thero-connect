@@ -103,7 +103,7 @@ Only a local administrator (root on Linux) may change `config.yaml`. Thero can o
 - In lists with "Read items that were created by the user", only the author of an item is a reader, and only when the author may also read the item.
 - View Only and Limited Access grant nothing, also for list items, because they lack Open Items or View Items.
 - Pages (`.aspx`) in libraries, hidden lists, catalogs, lists with Information Rights Management and webs or lists excluded from search (`NoCrawl`) are not indexed. Attachments whose name contains `#` or `%` are skipped.
-- Readers given through SAML, forms or other claim providers, and groups of other domains, grant nothing. Web application user policies only remove readers: their grants are ignored, their denies come from SharePoint's answer. Policies of zones other than the one in `url` are not evaluated.
+- Readers given through SAML, forms or other claim providers, local groups and groups of other domains grant nothing. Web application user policies only remove readers: their grants are ignored, their denies come from SharePoint's answer. Policies of zones other than the one in `url` are not evaluated.
 - Folders are part of the path. A renamed or moved file, item or folder is deleted in Thero and indexed again under its new path.
 - Kerberos only, never NTLM. HTTPS only with TLS 1.2 or later, HTTP/1.1, the system trust store, no proxy, no cookies and no redirects. A redirect, a forms login or a SAML only zone makes the root `unavailable`.
 - Every request is checked against an allow list before it is sent: `GET` below `/_api/` of the site collection and of webs the walk found, and `POST` only to `_api/contextinfo` and `_api/site/getchanges` of the site collection. No other method or path is ever sent.
