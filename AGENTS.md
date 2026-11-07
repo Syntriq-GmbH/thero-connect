@@ -34,6 +34,8 @@ go vet ./...
 go test ./...
 GOOS=windows GOARCH=amd64 go vet ./...
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o thero-connect.exe .
+GOOS=windows GOARCH=arm64 go vet ./...
+GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -o thero-connect-arm64.exe .
 go test -tags e2e -run TestE2E -count=1 -timeout 0 .
 ```
 
@@ -62,4 +64,4 @@ Everything is `package main` at the repository root.
 
 ## Testing
 
-Portable logic runs on macOS and Linux through `fakeSource`. Windows code is vetted and built with `GOOS=windows`, and its layout tests run on the Windows CI job. Behaviour against a real domain follows the checklist in the README.
+Portable logic runs on macOS and Linux through `fakeSource`. Windows code is vetted and built with `GOOS=windows` for amd64 and arm64, and its layout tests run on the Windows CI jobs. Releases ship `thero-connect.exe` (amd64) and `thero-connect-arm64.exe` (arm64 Windows Server and Windows on ARM). Behaviour against a real domain follows the checklist in the README.

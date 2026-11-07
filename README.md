@@ -26,7 +26,7 @@ Access limits: group membership, identity mappings and share permissions take ef
 
 ## Install
 
-1. Download `thero-connect.exe` and `thero-connect.exe.sha256` from the latest release and compare the checksum (`Get-FileHash thero-connect.exe`).
+1. Download `thero-connect.exe` and `thero-connect.exe.sha256` from the latest release and compare the checksum (`Get-FileHash thero-connect.exe`). On arm64 Windows Server or Windows on ARM take `thero-connect-arm64.exe` and `thero-connect-arm64.exe.sha256` instead and save the binary as `thero-connect.exe`.
 2. Copy the binary to `C:\Program Files\Thero Connect\`.
 3. As administrator create `C:\ProgramData\Thero Connect` and write `config.yaml` there (see below).
 4. In Thero open the connector settings, click "Create install command" and run the command as administrator within 15 minutes:
@@ -108,9 +108,11 @@ go vet ./...
 go test ./...
 GOOS=windows GOARCH=amd64 go vet ./...
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o thero-connect.exe .
+GOOS=windows GOARCH=arm64 go vet ./...
+GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -o thero-connect-arm64.exe .
 go test -tags e2e -run TestE2E -count=1 -timeout 0 .
 ```
 
 `protocol/v1` holds the canonical protocol (JSON schema, fixtures, `chunk.bin`). thero-ai keeps a byte-identical copy; `TestDigest` pins it. A breaking change creates `protocol/v2`.
 
-Release: push a tag `vX.Y.Z`. The release workflow tests, builds `thero-connect.exe` for Windows amd64 with the version from the tag and publishes it with its `.sha256` file as a GitHub release.
+Release: push a tag `vX.Y.Z`. The release workflow tests, builds `thero-connect.exe` for Windows amd64 and `thero-connect-arm64.exe` for Windows arm64 with the version from the tag and publishes both with their `.sha256` files as a GitHub release.

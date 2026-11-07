@@ -18,7 +18,9 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
       - run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME#v}" -o thero-connect.exe .
+      - run: GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME#v}" -o thero-connect-arm64.exe .
       - run: sha256sum thero-connect.exe > thero-connect.exe.sha256
-      - run: gh release create "$GITHUB_REF_NAME" thero-connect.exe thero-connect.exe.sha256 --title "$GITHUB_REF_NAME" --generate-notes
+      - run: sha256sum thero-connect-arm64.exe > thero-connect-arm64.exe.sha256
+      - run: gh release create "$GITHUB_REF_NAME" thero-connect.exe thero-connect.exe.sha256 thero-connect-arm64.exe thero-connect-arm64.exe.sha256 --title "$GITHUB_REF_NAME" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
