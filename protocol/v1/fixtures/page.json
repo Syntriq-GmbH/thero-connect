@@ -1,0 +1,26 @@
+{
+  "type": "page",
+  "id": 1,
+  "cursor": "5f2b9c1d0e3a4b6c-1",
+  "entries": [
+    {
+      "path": "Reports/2026/q1.pdf",
+      "file": "00000000000a1b2c",
+      "size": 123456,
+      "created": 1761900000000,
+      "modified": 1761990000000,
+      "class": "7c9e6679f1a24b2c8d3e5f60718293a4"
+    },
+    {
+      "path": "Reports/2026/draft.docx",
+      "file": "00000000000a1b2d",
+      "size": 2048,
+      "created": 1761900000000,
+      "modified": 1761990000000,
+      "class": null
+    }
+  ],
+  "incomplete": [
+    "Archive/Locked"
+  ]
+}

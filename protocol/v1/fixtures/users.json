@@ -1,0 +1,24 @@
+{
+  "type": "users",
+  "id": 2,
+  "users": [
+    {
+      "email": "alice@example.com",
+      "sid": "S-1-5-21-1004336348-1177238915-682003330-1104",
+      "guid": "6f1c2b3a-4d5e-4f60-8172-93a4b5c6d7e8",
+      "upn": "alice@corp.example.com",
+      "mail": "alice@example.com",
+      "enabled": true,
+      "ambiguous": false
+    },
+    {
+      "email": "bob@example.com",
+      "sid": "S-1-5-21-1004336348-1177238915-682003330-1105",
+      "guid": "0a1b2c3d-4e5f-4061-8273-94a5b6c7d8e9",
+      "upn": "bob@corp.example.com",
+      "mail": "",
+      "enabled": true,
+      "ambiguous": false
+    }
+  ]
+}

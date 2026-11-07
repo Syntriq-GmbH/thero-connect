@@ -1,0 +1,6 @@
+{
+  "type": "error",
+  "id": 4,
+  "code": "changed",
+  "message": "file changed since the walk"
+}

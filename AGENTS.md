@@ -18,6 +18,7 @@ Top priority for every change. It outranks elegance, extensibility and completen
 - **Add nothing that is not needed.** No extra configuration, no new package, no new dependency without a consumer in the same commit.
 - **Standard library first.** `CGO_ENABLED=0`; Windows APIs through `golang.org/x/sys/windows`.
 - **Fail closed.** When a permission, path or identity cannot be determined exactly, the client returns an error and grants nothing.
+- Windows API calls live only in `*_windows.go`; everything else stays testable behind `source`.
 
 ## Git
 
@@ -32,5 +33,33 @@ Top priority for every change. It outranks elegance, extensibility and completen
 go vet ./...
 go test ./...
 GOOS=windows GOARCH=amd64 go vet ./...
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o thero-connect.exe ./cmd/thero-connect
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o thero-connect.exe .
+go test -tags e2e -run TestE2E -count=1 -timeout 0 .
 ```
+
+## Layout
+
+Everything is `package main` at the repository root.
+
+- `main.go`: command dispatch, flags, the `check` command, `config.yaml` loading and validation, state paths, atomic file writes, logger setup.
+- `link.go`: protocol structs, TLS, `enroll`, `serve` with the reconnect loop, one link session, certificate renewal.
+- `ops.go`: the handlers `walk`, `principals`, `access` and `read`, walk state, class registry (`classes.json`), last complete walk per root (`walks.json`), daily quota (`quota.json`), rate limiter, read window.
+- `source.go`: the `source` and `file` interfaces, portable types, sentinel errors and the pure helpers (paths, UNC, excludes, descriptors, classes, LDAP filter, account matching, error codes).
+- `source_windows.go`: `windowsSource`, the only real `source`.
+- `system_windows.go`: DPAPI, service, folder ACLs, install, uninstall, event log.
+- `system_other.go`: development stand-ins of the system functions for other platforms; never released.
+- `link_test.go`: `fakeSource` and in-process TLS link server tests.
+- `ops_test.go`: handler tests on `fakeSource`.
+- `source_test.go`: table tests of the pure helpers and security descriptor builders.
+- `source_windows_test.go`: struct layout and DLL export tests, run on the Windows CI job.
+- `protocol_test.go`: fixture round trip, protocol digest, chunk layout.
+- `e2e_test.go`: real enrollment and link against a running thero-ai (`-tags e2e`).
+- `protocol/v1/`: the canonical protocol.
+
+## Protocol
+
+`protocol/v1` (schema, fixtures, `chunk.bin`) is canonical. Change the schema, the fixtures, `protocolDigest` in `protocol_test.go` and the thero-ai copy `backend/python/tests/fixtures/smb_protocol_v1` with its `PROTOCOL_DIGEST` together. A breaking change creates `protocol/v2` and version 2.
+
+## Testing
+
+Portable logic runs on macOS and Linux through `fakeSource`. Windows code is vetted and built with `GOOS=windows`, and its layout tests run on the Windows CI job. Behaviour against a real domain follows the checklist in the README.

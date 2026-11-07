@@ -1,0 +1,9 @@
+{
+  "type": "read",
+  "id": 4,
+  "root": "finance",
+  "path": "Reports/2026/q1.pdf",
+  "file": "00000000000a1b2c",
+  "size": 123456,
+  "modified": 1761990000000
+}

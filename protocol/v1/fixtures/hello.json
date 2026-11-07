@@ -1,0 +1,10 @@
+{
+  "type": "hello",
+  "version": 1,
+  "client": "1.0.0",
+  "machine": "FS01",
+  "roots": [
+    "finance",
+    "hr"
+  ]
+}

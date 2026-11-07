@@ -1,0 +1,25 @@
+{
+  "type": "rights",
+  "id": 3,
+  "classes": [
+    {
+      "class": "7c9e6679f1a24b2c8d3e5f60718293a4",
+      "readers": [
+        0,
+        1
+      ]
+    },
+    {
+      "class": "0d1e2f3a4b5c6d7e8f90a1b2c3d4e5f6",
+      "readers": [
+        0
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "root": "hr",
+      "code": "denied"
+    }
+  ]
+}

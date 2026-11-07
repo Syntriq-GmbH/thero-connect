@@ -1,0 +1,4 @@
+{
+  "type": "renew",
+  "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIIBFAKE\n-----END CERTIFICATE REQUEST-----\n"
+}

@@ -1,0 +1,8 @@
+{
+  "type": "principals",
+  "id": 2,
+  "emails": [
+    "alice@example.com",
+    "bob@example.com"
+  ]
+}

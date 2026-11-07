@@ -1,0 +1,8 @@
+{
+  "type": "enroll",
+  "version": 1,
+  "token": "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE",
+  "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIIBFAKE\n-----END CERTIFICATE REQUEST-----\n",
+  "machine": "FS01",
+  "client": "1.0.0"
+}
