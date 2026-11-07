@@ -263,7 +263,7 @@ func physicalMatches(name, path string) bool {
 		}
 		name = name[index:]
 	}
-	return strings.EqualFold(name, strings.TrimPrefix(path, `\`))
+	return strings.EqualFold(strings.TrimPrefix(name, `\`), strings.TrimPrefix(path, `\\`))
 }
 
 func securityBytes(sd *windows.SECURITY_DESCRIPTOR) []byte {

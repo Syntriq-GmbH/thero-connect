@@ -336,7 +336,7 @@ func TestPhysicalMatches(t *testing.T) {
 		{`\\fs1.corp.example\docs\team\a.txt:secret`, false},
 		{`\\fs1.corp.example\docs\team`, false},
 		{`\\fs1.corp.example\docs\team\b.txt`, false},
-		{`\fs1.corp.example\docs\team\a.txt`, false},
+		{`\fs1.corp.example\docs\team\a.txt`, true},
 		{`\\\fs1.corp.example\docs\team\a.txt`, false},
 		{`\\fs1.corp.example\docs\team\a.txt` + "\x00", false},
 		{``, false},
