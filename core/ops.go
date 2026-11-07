@@ -31,7 +31,7 @@ const (
 	ackWindow    = 4 << 20
 	readSlots    = 2
 	snapshotAge  = 6 * time.Hour
-	pageTime     = 120 * time.Second
+	listTime     = 120 * time.Second
 	referralHops = 16
 )
 
@@ -329,7 +329,7 @@ func (a *agent) walk(m message) any {
 	registryChanged := false
 	pageStart := a.now()
 	listings := 0
-	for len(entries) < pageSize && len(incomplete) < pageSize && (listings == 0 || a.now().Sub(pageStart) < pageTime) {
+	for len(entries) < pageSize && len(incomplete) < pageSize && (listings == 0 || a.now().Sub(pageStart) < listTime) {
 		if len(w.files) > 0 {
 			pending := w.files[0]
 			w.files = w.files[1:]
