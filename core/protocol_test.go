@@ -14,7 +14,7 @@ import (
 	"testing"
 )
 
-const protocolDigest = "ea01732824900e9ec1a66ead0200a52c7e7a327680a807a39fcc0724e123c561"
+const protocolDigest = "5c70cb0f35bc0d1c9749ccd7a570ffe90f22cbcb6dc436005855772a09bb470b"
 
 func TestFixturesRoundTrip(t *testing.T) {
 	clientSent := map[string]func() any{
@@ -29,7 +29,9 @@ func TestFixturesRoundTrip(t *testing.T) {
 	}
 	serverSent := []string{"enrolled", "welcome", "walk", "principals", "access", "read", "ack", "cancel", "renewed", "error"}
 	files, _ := filepath.Glob("../protocol/v1/fixtures/*.json")
-	if len(files) != 17 {
+	sharepoint, _ := filepath.Glob("../protocol/v1/fixtures/sharepoint/*.json")
+	files = append(files, sharepoint...)
+	if len(files) != 19 {
 		t.Fatalf("%d fixtures", len(files))
 	}
 	for _, name := range files {

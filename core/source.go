@@ -2,6 +2,7 @@ package core
 
 import (
 	"crypto/sha256"
+	"encoding/asn1"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -54,6 +55,14 @@ type Source interface {
 	Accounts(filter string) ([]Account, error)
 	Allowed(server string, sids []string, descriptors [][]byte) ([][]bool, error)
 	Open(root, rel string) (File, error)
+	Members(sids []string) ([]Member, error)
+	Negotiate(spn string) (string, error)
+}
+
+type Member struct {
+	Login string
+	SID   string
+	SIDs  []string
 }
 
 type Token struct {
@@ -189,6 +198,90 @@ func AccountOf(values map[string][][]byte, now time.Time) (Account, bool) {
 		Proxies: proxies,
 		Enabled: enabled,
 	}, true
+}
+
+var MemberAttributes = []string{"objectSid", "objectClass", "sAMAccountName", "tokenGroups"}
+
+func MemberOf(values map[string][][]byte, domain, netbios string) (Member, bool) {
+	objectSid := values["objectSid"]
+	if len(objectSid) != 1 {
+		return Member{}, false
+	}
+	sid, size, err := SIDString(objectSid[0])
+	if err != nil || size != len(objectSid[0]) || !InDomain(sid, domain) {
+		return Member{}, false
+	}
+	user, computer := false, false
+	for _, class := range values["objectClass"] {
+		user = user || strings.EqualFold(string(class), "user")
+		computer = computer || strings.EqualFold(string(class), "computer")
+	}
+	names := values["sAMAccountName"]
+	if !user || computer || len(names) != 1 || len(names[0]) == 0 || netbios == "" || len(values["tokenGroups"]) == 0 {
+		return Member{}, false
+	}
+	member := Member{
+		Login: strings.ToLower("i:0#.w|" + netbios + `\` + string(names[0])),
+		SID:   strings.ToLower(sid),
+		SIDs:  []string{strings.ToLower(sid)},
+	}
+	for _, raw := range values["tokenGroups"] {
+		group, size, err := SIDString(raw)
+		if err != nil || size != len(raw) {
+			return Member{}, false
+		}
+		member.SIDs = append(member.SIDs, strings.ToLower(group))
+	}
+	return member, true
+}
+
+func InDomain(sid, domain string) bool {
+	rest, ok := strings.CutPrefix(sid, domain+"-")
+	return ok && domain != "" && rest != "" && !strings.Contains(rest, "-")
+}
+
+var (
+	spnegoOID     = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 2}
+	kerberosOID   = asn1.ObjectIdentifier{1, 2, 840, 113554, 1, 2, 2}
+	msKerberosOID = asn1.ObjectIdentifier{1, 2, 840, 48018, 1, 2, 2}
+)
+
+type negTokenInit struct {
+	MechTypes   []asn1.ObjectIdentifier `asn1:"explicit,tag:0"`
+	ReqFlags    asn1.BitString          `asn1:"explicit,optional,tag:1"`
+	MechToken   []byte                  `asn1:"explicit,optional,tag:2"`
+	MechListMIC []byte                  `asn1:"explicit,optional,tag:3"`
+}
+
+func KerberosToken(token []byte) error {
+	refused := fmt.Errorf("%w: not a Kerberos token", ErrUnavailable)
+	kerberos := func(oid asn1.ObjectIdentifier) bool { return oid.Equal(kerberosOID) || oid.Equal(msKerberosOID) }
+	var outer asn1.RawValue
+	if rest, err := asn1.Unmarshal(token, &outer); err != nil || len(rest) != 0 || outer.Class != asn1.ClassApplication || outer.Tag != 0 {
+		return refused
+	}
+	var mech asn1.ObjectIdentifier
+	body, err := asn1.Unmarshal(outer.Bytes, &mech)
+	if err != nil || !mech.Equal(spnegoOID) {
+		return refused
+	}
+	var init negTokenInit
+	if rest, err := asn1.UnmarshalWithParams(body, &init, "explicit,tag:0"); err != nil || len(rest) != 0 || len(init.MechTypes) == 0 || !kerberos(init.MechTypes[0]) {
+		return refused
+	}
+	var inner asn1.RawValue
+	if rest, err := asn1.Unmarshal(init.MechToken, &inner); err != nil || len(rest) != 0 || inner.Class != asn1.ClassApplication || inner.Tag != 0 {
+		return refused
+	}
+	request, err := asn1.Unmarshal(inner.Bytes, &mech)
+	if err != nil || !kerberos(mech) || len(request) < 2 || request[0] != 0x01 || request[1] != 0x00 {
+		return refused
+	}
+	var apReq asn1.RawValue
+	if rest, err := asn1.Unmarshal(request[2:], &apReq); err != nil || len(rest) != 0 || apReq.Class != asn1.ClassApplication || apReq.Tag != 14 {
+		return refused
+	}
+	return nil
 }
 
 type ace struct {

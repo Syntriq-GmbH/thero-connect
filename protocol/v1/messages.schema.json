@@ -268,11 +268,28 @@
               },
               "class": {
                 "$ref": "#/$defs/class"
+              },
+              "url": {
+                "type": "string",
+                "maxLength": 2048,
+                "pattern": "^https?://[^\\s]+$"
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255
               }
             }
           }
         },
         "incomplete": {
+          "type": "array",
+          "maxItems": 500,
+          "items": {
+            "$ref": "#/$defs/path"
+          }
+        },
+        "deleted": {
           "type": "array",
           "maxItems": 500,
           "items": {
@@ -502,6 +519,9 @@
         },
         "cursor": {
           "$ref": "#/$defs/cursor"
+        },
+        "changes": {
+          "const": true
         }
       }
     },

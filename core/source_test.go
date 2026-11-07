@@ -1,13 +1,23 @@
 package core
 
 import (
+	"encoding/asn1"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/oiweiwei/gokrb5.fork/v9/client"
+	krbconfig "github.com/oiweiwei/gokrb5.fork/v9/config"
+	"github.com/oiweiwei/gokrb5.fork/v9/iana/etypeID"
+	"github.com/oiweiwei/gokrb5.fork/v9/iana/nametype"
+	"github.com/oiweiwei/gokrb5.fork/v9/messages"
+	"github.com/oiweiwei/gokrb5.fork/v9/spnego"
+	"github.com/oiweiwei/gokrb5.fork/v9/types"
 )
 
 func sidBytes(sid string) []byte {
@@ -459,5 +469,183 @@ func TestDeniedSIDs(t *testing.T) {
 	}
 	if got := DeniedSIDs(nil); len(got) != 0 {
 		t.Fatalf("DeniedSIDs(nil) = %v", got)
+	}
+}
+
+func TestInDomain(t *testing.T) {
+	domain := "S-1-5-21-1-2-3"
+	cases := map[string]struct {
+		sid, domain string
+		want        bool
+	}{
+		"user":             {"S-1-5-21-1-2-3-1104", domain, true},
+		"group":            {"S-1-5-21-1-2-3-513", domain, true},
+		"domain itself":    {domain, domain, false},
+		"trailing dash":    {domain + "-", domain, false},
+		"nested":           {"S-1-5-21-1-2-3-1104-5", domain, false},
+		"other domain":     {"S-1-5-21-1-2-4-1104", domain, false},
+		"longer prefix":    {"S-1-5-21-1-2-33-1104", domain, false},
+		"builtin":          {"S-1-5-32-544", domain, false},
+		"well known":       {"S-1-1-0", domain, false},
+		"empty domain":     {"S-1-5-21-1-2-3-1104", "", false},
+		"empty sid":        {"", domain, false},
+		"lower case":       {"s-1-5-21-1-2-3-1104", domain, false},
+		"suffix only":      {"x" + domain + "-1104", domain, false},
+		"child domain sid": {"S-1-5-21-9-8-7-1104", domain, false},
+	}
+	for name, c := range cases {
+		if got := InDomain(c.sid, c.domain); got != c.want {
+			t.Errorf("%s: InDomain(%q, %q) = %v", name, c.sid, c.domain, got)
+		}
+	}
+}
+
+func TestMemberOf(t *testing.T) {
+	domain := "S-1-5-21-1-2-3"
+	base := func() map[string][][]byte {
+		return map[string][][]byte{
+			"objectSid":      {sidBytes("S-1-5-21-1-2-3-1104")},
+			"objectClass":    {[]byte("top"), []byte("person"), []byte("organizationalPerson"), []byte("user")},
+			"sAMAccountName": {[]byte("Alice")},
+			"tokenGroups":    {sidBytes("S-1-5-21-1-2-3-513"), sidBytes("S-1-5-32-545"), sidBytes("S-1-5-21-9-8-7-1200")},
+		}
+	}
+	got, ok := MemberOf(base(), domain, "CORP")
+	want := Member{Login: `i:0#.w|corp\alice`, SID: "s-1-5-21-1-2-3-1104", SIDs: []string{"s-1-5-21-1-2-3-1104", "s-1-5-21-1-2-3-513", "s-1-5-32-545", "s-1-5-21-9-8-7-1200"}}
+	if !ok || got.Login != want.Login || got.SID != want.SID || !slices.Equal(got.SIDs, want.SIDs) {
+		t.Fatalf("MemberOf = %+v, %v", got, ok)
+	}
+	if got, ok := MemberOf(base(), domain, "Corp"); !ok || got.Login != `i:0#.w|corp\alice` {
+		t.Errorf("mixed case netbios: %+v, %v", got, ok)
+	}
+	upper := base()
+	upper["objectClass"] = [][]byte{[]byte("USER")}
+	if _, ok := MemberOf(upper, domain, "CORP"); !ok {
+		t.Error("upper case user class refused")
+	}
+	change := func(name string, values ...[]byte) map[string][][]byte {
+		changed := base()
+		if values == nil {
+			delete(changed, name)
+			return changed
+		}
+		changed[name] = values
+		return changed
+	}
+	refused := map[string]struct {
+		values          map[string][][]byte
+		domain, netbios string
+	}{
+		"no sid":                {change("objectSid"), domain, "CORP"},
+		"bad sid":               {change("objectSid", []byte("x")), domain, "CORP"},
+		"sid with trailing":     {change("objectSid", append(sidBytes("S-1-5-21-1-2-3-1104"), 0)), domain, "CORP"},
+		"two sids":              {change("objectSid", sidBytes("S-1-5-21-1-2-3-1104"), sidBytes("S-1-5-21-1-2-3-1105")), domain, "CORP"},
+		"foreign domain":        {change("objectSid", sidBytes("S-1-5-21-9-8-7-1104")), domain, "CORP"},
+		"domain sid":            {change("objectSid", sidBytes(domain)), domain, "CORP"},
+		"builtin sid":           {change("objectSid", sidBytes("S-1-5-32-544")), domain, "CORP"},
+		"empty domain":          {base(), "", "CORP"},
+		"no class":              {change("objectClass"), domain, "CORP"},
+		"group":                 {change("objectClass", []byte("top"), []byte("group")), domain, "CORP"},
+		"foreign principal":     {change("objectClass", []byte("top"), []byte("foreignSecurityPrincipal")), domain, "CORP"},
+		"computer":              {change("objectClass", []byte("top"), []byte("person"), []byte("user"), []byte("computer")), domain, "CORP"},
+		"no account name":       {change("sAMAccountName"), domain, "CORP"},
+		"empty account name":    {change("sAMAccountName", []byte("")), domain, "CORP"},
+		"two account names":     {change("sAMAccountName", []byte("alice"), []byte("bob")), domain, "CORP"},
+		"empty netbios":         {base(), domain, ""},
+		"no token groups":       {change("tokenGroups"), domain, "CORP"},
+		"empty token groups":    {change("tokenGroups", [][]byte{}...), domain, "CORP"},
+		"bad token group":       {change("tokenGroups", sidBytes("S-1-5-21-1-2-3-513"), []byte("x")), domain, "CORP"},
+		"token group trailing":  {change("tokenGroups", append(sidBytes("S-1-5-21-1-2-3-513"), 1)), domain, "CORP"},
+		"lower case domain sid": {base(), "s-1-5-21-1-2-3", "CORP"},
+	}
+	for name, c := range refused {
+		if got, ok := MemberOf(c.values, c.domain, c.netbios); ok || got.Login != "" || got.SID != "" || got.SIDs != nil {
+			t.Errorf("%s accepted: %+v", name, got)
+		}
+	}
+}
+
+func TestKerberosToken(t *testing.T) {
+	cl := client.NewWithPassword("alice", "CORP.EXAMPLE", "secret", krbconfig.New())
+	ticket := messages.Ticket{
+		TktVNO:  5,
+		Realm:   "CORP.EXAMPLE",
+		SName:   types.NewPrincipalName(nametype.KRB_NT_SRV_INST, "HTTP/intranet.corp.example"),
+		EncPart: types.EncryptedData{EType: etypeID.AES256_CTS_HMAC_SHA1_96, KVNO: 2, Cipher: []byte{1, 2, 3, 4}},
+	}
+	key := types.EncryptionKey{KeyType: etypeID.AES256_CTS_HMAC_SHA1_96, KeyValue: make([]byte, 32)}
+	init, err := spnego.NewNegTokenInitKRB5(cl, ticket, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	genuine, err := (&spnego.SPNEGOToken{Init: true, NegTokenInit: init}).Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	kerberos := asn1.ObjectIdentifier{1, 2, 840, 113554, 1, 2, 2}
+	msKerberos := asn1.ObjectIdentifier{1, 2, 840, 48018, 1, 2, 2}
+	ntlm := asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 2, 2, 10}
+	application := func(oid asn1.ObjectIdentifier, rest ...[]byte) []byte {
+		header, _ := asn1.Marshal(oid)
+		token, _ := asn1.Marshal(asn1.RawValue{Class: asn1.ClassApplication, Tag: 0, IsCompound: true, Bytes: slices.Concat(append([][]byte{header}, rest...)...)})
+		return token
+	}
+	negotiation := func(outer asn1.ObjectIdentifier, mechTypes []asn1.ObjectIdentifier, mechToken []byte) []byte {
+		body, _ := asn1.MarshalWithParams(negTokenInit{MechTypes: mechTypes, MechToken: mechToken}, "explicit,tag:0")
+		return application(outer, body)
+	}
+	spnegoOID := asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 2}
+	inner := init.MechTokenBytes
+	var wrapped asn1.RawValue
+	var oid asn1.ObjectIdentifier
+	asn1.Unmarshal(inner, &wrapped)
+	request, _ := asn1.Unmarshal(wrapped.Bytes, &oid)
+	apReq := request[2:]
+	apRep, _ := asn1.Marshal(asn1.RawValue{Class: asn1.ClassApplication, Tag: 15, IsCompound: true, Bytes: []byte{0x30, 0x00}})
+	ntlmssp := []byte("NTLMSSP\x00\x01\x00\x00\x00\x07\x82\x08\xa2")
+	if rebuilt := negotiation(spnegoOID, []asn1.ObjectIdentifier{kerberos}, inner); !slices.Equal(rebuilt, genuine) {
+		t.Fatalf("rebuilt token differs:\n%x\n%x", rebuilt, genuine)
+	}
+	accepted := map[string][]byte{
+		"kerberos":                 genuine,
+		"microsoft kerberos first": negotiation(spnegoOID, []asn1.ObjectIdentifier{msKerberos, kerberos}, inner),
+		"microsoft inner oid":      negotiation(spnegoOID, []asn1.ObjectIdentifier{msKerberos}, application(msKerberos, []byte{1, 0}, apReq)),
+		"ntlm listed later":        negotiation(spnegoOID, []asn1.ObjectIdentifier{kerberos, ntlm}, inner),
+	}
+	for name, token := range accepted {
+		if err := KerberosToken(token); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	negTokenResp, _ := (&spnego.SPNEGOToken{Resp: true, NegTokenResp: spnego.NegTokenResp{NegState: 1, ResponseToken: inner}}).Marshal()
+	only := []asn1.ObjectIdentifier{kerberos}
+	refused := map[string][]byte{
+		"empty":                {},
+		"garbage":              []byte("not a token"),
+		"raw ntlmssp":          ntlmssp,
+		"raw kerberos token":   inner,
+		"ntlm negotiation":     negotiation(spnegoOID, []asn1.ObjectIdentifier{ntlm}, ntlmssp),
+		"ntlm first":           negotiation(spnegoOID, []asn1.ObjectIdentifier{ntlm, kerberos}, inner),
+		"no mech types":        negotiation(spnegoOID, []asn1.ObjectIdentifier{}, inner),
+		"missing mech token":   negotiation(spnegoOID, only, nil),
+		"ntlmssp mech token":   negotiation(spnegoOID, only, ntlmssp),
+		"ntlm inner oid":       negotiation(spnegoOID, only, application(ntlm, []byte{1, 0}, apReq)),
+		"ap-rep token id":      negotiation(spnegoOID, only, application(kerberos, []byte{2, 0}, apReq)),
+		"error token id":       negotiation(spnegoOID, only, application(kerberos, []byte{3, 0}, apReq)),
+		"ap-rep body":          negotiation(spnegoOID, only, application(kerberos, []byte{1, 0}, apRep)),
+		"no request":           negotiation(spnegoOID, only, application(kerberos, []byte{1, 0})),
+		"short token id":       negotiation(spnegoOID, only, application(kerberos, []byte{1})),
+		"request trailing":     negotiation(spnegoOID, only, application(kerberos, []byte{1, 0}, apReq, []byte{0})),
+		"mech token trailing":  negotiation(spnegoOID, only, append(slices.Clone(inner), 0)),
+		"token trailing":       append(slices.Clone(genuine), 0),
+		"truncated":            genuine[:40],
+		"negotiation response": negTokenResp,
+		"kerberos outer oid":   negotiation(kerberos, only, inner),
+		"ntlm outer oid":       negotiation(ntlm, only, inner),
+	}
+	for name, token := range refused {
+		if err := KerberosToken(token); !errors.Is(err, ErrUnavailable) || !strings.Contains(err.Error(), "not a Kerberos token") {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
 }

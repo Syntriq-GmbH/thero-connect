@@ -483,6 +483,14 @@ func (s *linuxSource) descriptor(path string) ([]byte, uint64, error) {
 	return bytes.Clone(security.Output()), uint64(id.IndexNumber()), nil
 }
 
+func (*linuxSource) Members(sids []string) ([]core.Member, error) {
+	return nil, core.ErrUnavailable
+}
+
+func (*linuxSource) Negotiate(spn string) (string, error) {
+	return "", core.ErrUnavailable
+}
+
 func (s *linuxSource) Open(root, rel string) (core.File, error) {
 	file, err := s.open(root, rel)
 	if errors.Is(err, errSessionExpired) || errors.Is(err, errRetry) {

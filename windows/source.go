@@ -476,6 +476,14 @@ func (windowsSource) Allowed(server string, sids []string, descriptors [][]byte)
 	return matrix[:len(sids)], nil
 }
 
+func (windowsSource) Members(sids []string) ([]core.Member, error) {
+	return nil, core.ErrUnavailable
+}
+
+func (windowsSource) Negotiate(spn string) (string, error) {
+	return "", core.ErrUnavailable
+}
+
 func (windowsSource) Open(root, rel string) (core.File, error) {
 	handle, err := openInShare(root+`\`+rel, windows.FILE_READ_DATA|windows.FILE_READ_ATTRIBUTES|windows.SYNCHRONIZE, windows.FILE_SHARE_READ|windows.FILE_SHARE_DELETE, windows.FILE_FLAG_SEQUENTIAL_SCAN, false)
 	if err != nil {
