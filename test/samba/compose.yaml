@@ -18,6 +18,8 @@ volumes:
   dc1-srv:
   fs1-lib:
   fs1-srv:
+  fs2-lib:
+  fs2-srv:
 
 configs:
   fs1-smb:
@@ -46,6 +48,50 @@ configs:
       [ownerrights]
        path = /srv/ownerrights
        read only = no
+      [replica]
+       path = /srv/replica
+       read only = no
+      [ns]
+       path = /srv/ns
+       read only = no
+       msdfs root = yes
+       msdfs shuffle referrals = yes
+       follow symlinks = yes
+  fs2-smb:
+    content: |
+      [global]
+       workgroup = SAMDOM
+       realm = SAMDOM.EXAMPLE.COM
+       netbios name = FS2
+       security = ads
+       idmap config * : backend = tdb
+       idmap config * : range = 3000-7999
+       idmap config SAMDOM : backend = rid
+       idmap config SAMDOM : range = 10000-999999
+       vfs objects = acl_xattr
+       acl_xattr:ignore system acls = yes
+       acl_xattr:default acl style = windows
+       follow symlinks = no
+       load printers = no
+       disable spoolss = yes
+      [docs]
+       path = /srv/docs
+       read only = no
+      [projects]
+       path = /srv/projects
+       read only = no
+      [replica]
+       path = /srv/replica
+       read only = no
+      [ns2]
+       path = /srv/ns2
+       read only = no
+       msdfs root = yes
+       follow symlinks = yes
+      [ns3]
+       path = /srv/ns3
+       read only = no
+       msdfs root = yes
   fs1-krb5:
     content: |
       [libdefaults]
@@ -108,8 +154,40 @@ services:
       - bash
       - -ec
       - |
-        mkdir -p /srv/docs /srv/restricted /srv/ownerrights
-        chmod 0755 /srv /srv/docs /srv/restricted /srv/ownerrights
+        mkdir -p /srv/docs /srv/restricted /srv/ownerrights /srv/replica /srv/ns
+        chmod 0755 /srv /srv/docs /srv/restricted /srv/ownerrights /srv/replica /srv/ns
         until net ads join -U "administrator%$$ADMIN_PASS" dnshostname=fs1.samdom.example.com; do sleep 2; done
+        winbindd --foreground --no-process-group &
+        exec smbd --foreground --no-process-group
+
+  fs2:
+    image: thero-smb-samba
+    pull_policy: never
+    depends_on: [dc1]
+    hostname: fs2
+    domainname: samdom.example.com
+    cap_add: [SYS_ADMIN]
+    dns: ["${THERO_SMB_NET:-172.30.53}.10"]
+    dns_search: [samdom.example.com]
+    environment:
+      ADMIN_PASS: Adm1n#Thero2026
+    networks:
+      thero-smb:
+        ipv4_address: ${THERO_SMB_NET:-172.30.53}.30
+    volumes:
+      - fs2-lib:/var/lib/samba
+      - fs2-srv:/srv
+    configs:
+      - source: fs2-smb
+        target: /etc/samba/smb.conf
+      - source: fs1-krb5
+        target: /etc/krb5.conf
+    command:
+      - bash
+      - -ec
+      - |
+        mkdir -p /srv/docs /srv/projects /srv/replica /srv/ns2 /srv/ns3
+        chmod 0755 /srv /srv/docs /srv/projects /srv/replica /srv/ns2 /srv/ns3
+        until net ads join -U "administrator%$$ADMIN_PASS" dnshostname=fs2.samdom.example.com; do sleep 2; done
         winbindd --foreground --no-process-group &
         exec smbd --foreground --no-process-group

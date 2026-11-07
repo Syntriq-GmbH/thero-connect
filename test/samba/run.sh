@@ -12,6 +12,7 @@ export THERO_SMB_PROJECT=${THERO_SMB_PROJECT:-thero-smb} THERO_SMB_NET=${THERO_S
 
 dc() { docker compose exec -T dc1 "$@"; }
 fs() { docker compose exec -T fs1 "$@"; }
+fs2() { docker compose exec -T fs2 "$@"; }
 smb() {
   local output
   output=$(dc "$@" 2>&1) || { echo "$output" >&2; exit 1; }
@@ -31,7 +32,8 @@ tree() {
   local server=$1 client="smbclient //$1.samdom.example.com" acl="smbcacls //$1.samdom.example.com" auth=(-U "SAMDOM\\administrator%$admin")
   local base="ACL:S-1-5-32-544:ALLOWED/0/FULL,ACL:SAMDOM\\svc-thero:ALLOWED/0/READ"
   local shares=docs
-  [ "$server" = fs1 ] && shares="docs restricted ownerrights"
+  [ "$server" = fs1 ] && shares="docs restricted ownerrights replica ns"
+  [ "$server" = fs2 ] && shares="docs projects replica ns2 ns3"
   for share in $shares; do
     docker compose exec -T "$server" samba-tool ntacl set --use-s3fs --service="$share" \
       "O:BAG:BAD:(A;OICI;0x1f01ff;;;BA)(A;OICI;0x1200a9;;;$svc)(A;CI;0x1200a9;;;${svc%-*}-513)" "/srv/$share"
@@ -39,6 +41,7 @@ tree() {
   done
   dc bash -c 'for f in "$@"; do printf "Content of %s" "$f" > "/tmp/content.${f//\//_}"; done' _ $files
   dc bash -c "printf 'Alice only: kestrel-7341' > /tmp/content.alice_plan.txt; printf 'Shared handbook: heron-2958' > /tmp/content.shared_handbook.txt"
+  dc bash -c "printf 'Replica: osprey-4417' > /tmp/content.replica; printf 'Projects: plover-8823' > /tmp/content.projects; printf 'root file' > /tmp/content.plain"
   local commands="mkdir link; "
   for f in $files; do
     commands+="mkdir ${f%%/*}; put /tmp/content.${f//\//_} $f; "
@@ -67,7 +70,43 @@ tree() {
     dc $acl/ownerrights o/doc.txt "${auth[@]}" --set "$base,ACL:SAMDOM\\Domain Users:ALLOWED/0/READ"
     fs sharesec restricted --replace "S-1-1-0:ALLOWED/0/FULL,$bob:DENIED/0/FULL"
     fs sharesec ownerrights --replace "S-1-3-4:ALLOWED/0/READ,$svc:ALLOWED/0/READ"
+    smb $client/replica "${auth[@]}" -c "mkdir r; put /tmp/content.replica r/doc.txt"
+    dc $acl/replica r/doc.txt "${auth[@]}" --set "$base,ACL:SAMDOM\\Domain Users:ALLOWED/0/READ"
+    smb $client/ns "${auth[@]}" -c "mkdir plain; mkdir sub; mkdir locked; put /tmp/content.plain plain/readme.txt"
+    dc $acl/ns plain "${auth[@]}" --set "$base,ACL:SAMDOM\\alice:ALLOWED/0/READ"
+    dc $acl/ns plain/readme.txt "${auth[@]}" --set "$base,ACL:SAMDOM\\alice:ALLOWED/0/READ"
+    dc $acl/ns locked "${auth[@]}" --set "ACL:S-1-5-32-544:ALLOWED/0/FULL"
   fi
+  if [ "$server" = fs2 ]; then
+    smb $client/projects "${auth[@]}" -c "put /tmp/content.projects p.txt"
+    dc $acl/projects p.txt "${auth[@]}" --set "$base,ACL:SAMDOM\\Domain Users:ALLOWED/0/READ"
+    smb $client/replica "${auth[@]}" -c "mkdir r; put /tmp/content.replica r/doc.txt"
+    dc $acl/replica r/doc.txt "${auth[@]}" --set "$base,ACL:SAMDOM\\Finance:ALLOWED/0/READ"
+    fs2 sharesec replica --replace "S-1-1-0:ALLOWED/0/FULL,$bob:DENIED/0/FULL"
+  fi
+  [ "$server" = dc1 ] || docker compose exec -T "$server" touch -d "2026-01-01 00:00:00 UTC" /srv/replica/r/doc.txt
+}
+
+namespace() {
+  dc samba-tool dns add dc1.samdom.example.com samdom.example.com down A "$THERO_SMB_NET.99" -U "administrator%$admin"
+  fs bash -ec '
+    ln -s "msdfs:fs1.samdom.example.com\\docs" /srv/ns/docs
+    ln -s "msdfs:fs1.samdom.example.com\\docs" /srv/ns/docs2
+    ln -s "msdfs:fs2.samdom.example.com\\projects" /srv/ns/projects
+    ln -s "msdfs:fs2.samdom.example.com\\replica,fs1.samdom.example.com\\replica" /srv/ns/replica
+    ln -s "msdfs:down.samdom.example.com\\projects,fs2.samdom.example.com\\projects" /srv/ns/failover
+    ln -s "msdfs:down.samdom.example.com\\projects" /srv/ns/offline
+    ln -s "msdfs:fs2\\projects" /srv/ns/short
+    ln -s "msdfs:fs1.samdom.example.com\\ns" /srv/ns/loop
+    ln -s "msdfs:fs2.samdom.example.com\\ns2" /srv/ns/nested
+    ln -s "msdfs:dc1.samdom.example.com\\docs\\shared" /srv/ns/sub/deep
+    ln -s "msdfs:fs1.samdom.example.com\\restricted" /srv/ns/restricted
+    ln -s "msdfs:fs1.samdom.example.com\\docs" /srv/ns/locked/inner'
+  fs2 bash -ec '
+    ln -s "msdfs:fs1.samdom.example.com\\restricted" /srv/ns2/back
+    ln -s "msdfs:fs1.samdom.example.com\\ns" /srv/ns2/up
+    ln -s "msdfs:fs1.samdom.example.com\\docs" /srv/ns3/docs'
+  dc bash -c 'mkdir -p /srv/corp /srv/selfns && printf "\n[corp]\n\tpath = /srv/corp\n\tmsdfs proxy = \\\\fs1.samdom.example.com\\\\ns\n[selfns]\n\tpath = /srv/selfns\n\tmsdfs root = yes\n" >> /etc/samba/smb.conf && smbcontrol all reload-config'
 }
 
 truth() {
@@ -82,8 +121,9 @@ first=1
 echo "["
 for server in $1; do
   list=""
-  for f in $3; do list+="docs:$f "; done
-  [ "$server" = fs1 ] && list+="restricted:r/doc.txt ownerrights:o/doc.txt"
+  [ "$server" = fs2 ] || for f in $3; do list+="docs:$f "; done
+  [ "$server" = fs1 ] && list+="restricted:r/doc.txt ownerrights:o/doc.txt replica:r/doc.txt ns:docs/shared/handbook.txt ns:projects/p.txt ns:sub/deep/handbook.txt ns:nested/back/r/doc.txt ns:plain/readme.txt"
+  [ "$server" = fs2 ] && list+="projects:p.txt replica:r/doc.txt"
   for item in $list; do
     share=${item%%:*} path=${item#*:}
     for user in $2; do
@@ -127,9 +167,11 @@ up)
   dc samba-tool group add DL_DenyAU --group-scope=Domain
   printf 'dn: CN=DL_DenyAU,CN=Users,DC=samdom,DC=example,DC=com\nchangetype: modify\nadd: member\nmember: CN=S-1-5-11,CN=ForeignSecurityPrincipals,DC=samdom,DC=example,DC=com\n' | dc ldbmodify -H /var/lib/samba/private/sam.ldb
   dc bash -c 'mkdir -p /srv/docs && chmod 0755 /srv /srv/docs && printf "\n[docs]\n\tpath = /srv/docs\n\tread only = no\n\tvfs objects = dfs_samba4 acl_xattr\n\tacl_xattr:ignore system acls = yes\n\tacl_xattr:default acl style = windows\n\tfollow symlinks = no\n" >> /etc/samba/smb.conf && smbcontrol all reload-config'
-  docker compose up -d fs1
+  docker compose up -d fs1 fs2
   wait_for fs wbinfo -t
+  wait_for fs2 wbinfo -t
   dc getent hosts fs1.samdom.example.com >/dev/null || dc samba-tool dns add dc1.samdom.example.com samdom.example.com fs1 A "$THERO_SMB_NET.20" -U "administrator%$admin"
+  dc getent hosts fs2.samdom.example.com >/dev/null || dc samba-tool dns add dc1.samdom.example.com samdom.example.com fs2 A "$THERO_SMB_NET.30" -U "administrator%$admin"
   dc samba-tool user create dave 'Dave#Pass2026' --mail-address=dave@samdom.example.com
   fs net sam createbuiltingroup Guests
   fs net sam createlocalgroup LocalGuests
@@ -138,6 +180,8 @@ up)
   bob=$(sid bob) svc=$(sid svc-thero)
   tree dc1
   tree fs1
+  tree fs2
+  namespace
   dc samba-tool domain exportkeytab /tmp/svc-thero.keytab --principal=svc-thero@SAMDOM.EXAMPLE.COM
   docker compose cp dc1:/tmp/svc-thero.keytab "$out/krb5.keytab"
   dc rm /tmp/svc-thero.keytab
@@ -148,11 +192,17 @@ fresh)
   dc samba-tool user disable erin
   ;;
 truth)
-  truth "dc1 fs1" "alice bob dave" "$out/truth.json"
+  truth "dc1 fs1 fs2" "alice bob dave" "$out/truth.json"
   echo "truth: $(grep -o '"read":true' "$out/truth.json" | wc -l | tr -d ' ') of $(grep -o '"read":' "$out/truth.json" | wc -l | tr -d ' ') reads succeed"
   ;;
 test)
   gotest '^TestSamba$'
+  ;;
+dfs)
+  gotest '^TestSambaDFS$'
+  ;;
+stop | start)
+  docker compose "$1" "${2:?usage: $0 $1 <service>}"
   ;;
 idmap)
   grep -q '"server":"fs1","share":"docs","path":"shared/handbook.txt","user":"dave","read":true' "$out/truth.json"
@@ -172,7 +222,7 @@ down)
   rm -rf "$out"
   ;;
 *)
-  echo "usage: $0 up|fresh|truth|test|idmap|down" >&2
+  echo "usage: $0 up|fresh|truth|test|dfs|idmap|stop <service>|start <service>|down" >&2
   exit 2
   ;;
 esac
