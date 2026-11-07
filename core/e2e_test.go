@@ -59,3 +59,47 @@ func TestE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestE2ESharePoint(t *testing.T) {
+	link := os.Getenv("SMB_E2E_URL")
+	if link == "" {
+		t.Skip("SMB_E2E_URL is not set")
+	}
+	token := os.Getenv("SMB_E2E_TOKEN")
+	seconds, err := strconv.Atoi(os.Getenv("SMB_E2E_SECONDS"))
+	if err != nil {
+		seconds = 900
+	}
+	port := os.Getenv("SP_E2E_PORT")
+	if port == "" {
+		port = "0"
+	}
+	f, src := e2eFarm(t, "127.0.0.1:"+port)
+	sum := sha256.Sum256([]byte(link + token))
+	dir := filepath.Join(os.TempDir(), "thero-connect-e2e-sharepoint-"+hex.EncodeToString(sum[:8]))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("roots:\n  - id: intranet\n    url: "+f.server.URL+"/sites/hr\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readIdentity(dir); err != nil {
+		machine, err := enroll(t.Context(), dir, cfg, link, os.Getenv("SMB_E2E_CA"), token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("enrolled as %s", machine)
+	}
+	t.Logf("farm at %s", f.server.URL)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(seconds)*time.Second)
+	defer cancel()
+	if err := serve(ctx, dir, cfg, src); err != nil {
+		t.Fatal(err)
+	}
+}

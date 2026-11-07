@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -187,7 +188,29 @@ func check(dir string) error {
 	}
 	src, err := host.Source(dir, cfg.Principal, cfg.samba)
 	if report("source", err) {
+		sites := newSites(src)
 		for _, r := range cfg.Roots {
+			if r.URL != "" {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				var site struct {
+					Path string `json:"ServerRelativeUrl"`
+				}
+				err := sites.get(ctx, r, http.MethodGet, apiPath(sitePath(r), "site?$select=Id,ServerRelativeUrl"), nil, &site)
+				if err == nil && site.Path != serverPath(r) {
+					err = errors.New("not a site collection URL")
+				}
+				if err != nil {
+					err = fmt.Errorf("%w (spn %s)", err, r.SPN)
+				}
+				report("root "+r.ID+" site", err)
+				err = sites.get(ctx, r, http.MethodGet, apiPath(sitePath(r), "web/siteusers?$select=Id&$top=1"), nil, &struct{}{})
+				if err != nil {
+					err = fmt.Errorf("%w (spn %s)", err, r.SPN)
+				}
+				report("root "+r.ID+" site users", err)
+				cancel()
+				continue
+			}
 			_, err := src.List(r.Path)
 			report("root "+r.ID+" list", err)
 			share, err := src.Share(r.Path)

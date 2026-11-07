@@ -624,3 +624,16 @@ func TestAtomicWriteReplacesPlantedTemp(t *testing.T) {
 		t.Fatal("temporary file left behind")
 	}
 }
+
+func TestWalkChangesOnFileShare(t *testing.T) {
+	src := newFakeSource()
+	src.add(`\\fs01\finance\a.txt`, "content", readable("S-1-1-0"))
+	a := testAgent(t, src)
+	reply := a.walk(message{Type: "walk", ID: 1, Root: "finance", Changes: true})
+	if refusal, ok := reply.(errorMessage); !ok || refusal.Code != "bad_request" || refusal.Message != "changes on a file share" {
+		t.Fatalf("changes walk on a file share answered %+v", reply)
+	}
+	if entries := walkAll(t, a, "finance"); len(entries) != 1 || a.sites != nil {
+		t.Fatalf("file share walk after a changes request: %d entries", len(entries))
+	}
+}
