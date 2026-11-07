@@ -164,7 +164,7 @@ func newAgent(dir string, cfg config, src Source) (*agent, error) {
 		}
 		switch {
 		case !stored && walked && !targeted:
-			a.mounts[r.ID] = mountTable{Path: r.Path, Targets: map[string]string{"": r.Path}}
+			a.mounts[r.ID] = mountTable{Path: r.Path}
 		case stored && table.Path != r.Path:
 			delete(a.mounts, r.ID)
 			delete(a.walked, r.ID)
@@ -523,7 +523,12 @@ func (a *agent) access(m message) any {
 		for _, key := range slices.Sorted(maps.Keys(byTarget)) {
 			sharePath := key
 			if key == "" {
-				if shareOf(table.Targets[""]) != shareOf(r.Path) {
+				physicalRoot := shareOf(table.Targets[""]) == shareOf(r.Path)
+				if table.Targets == nil {
+					_, err := a.src.Referral(r.Path)
+					physicalRoot = errors.Is(err, ErrNotFound)
+				}
+				if !physicalRoot {
 					fail("unavailable")
 					continue
 				}

@@ -1288,12 +1288,18 @@ func TestUpgradeSeedsPhysicalTable(t *testing.T) {
 	a := dfsAgent(t, src, root{ID: "finance", Path: `\\fs01\finance`}, root{ID: "ns", Path: `\\fs1.corp\ns`}, root{ID: "fresh", Path: `\\fs7.corp\f`})
 	walkAll(t, a, "finance")
 	walkAll(t, a, "ns")
+	for id, entry := range a.classes {
+		if entry.Target != "" {
+			delete(a.classes, id)
+		}
+	}
+	a.save("classes.json", a.classes)
 	os.Remove(statePath(a.dir, "mounts.json"))
 	upgraded, err := newAgent(a.dir, a.cfg, src)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(upgraded.mounts) != fmt.Sprint(map[string]mountTable{"finance": {Path: `\\fs01\finance`, Targets: map[string]string{"": `\\fs01\finance`}}}) {
+	if fmt.Sprint(upgraded.mounts) != fmt.Sprint(map[string]mountTable{"finance": {Path: `\\fs01\finance`}, "ns": {Path: `\\fs1.corp\ns`}}) {
 		t.Fatalf("mounts %v", upgraded.mounts)
 	}
 	if _, reply := readFile(upgraded, "finance", "a.txt", f); codeOfReply(reply) != "done" {
@@ -1304,7 +1310,7 @@ func TestUpgradeSeedsPhysicalTable(t *testing.T) {
 	for _, c := range rights.Classes {
 		readers[c.Class] = c.Readers
 	}
-	if !slices.Equal(readers[classOf("finance", readable(alice))], []int{0}) || fmt.Sprint(rights.Errors) != "[{ns unavailable} {fresh unavailable}]" {
+	if !slices.Equal(readers[classOf("finance", readable(alice))], []int{0}) || len(readers[classOf("ns", readable(alice))]) != 0 || fmt.Sprint(rights.Errors) != "[{ns unavailable} {fresh unavailable}]" {
 		t.Fatalf("readers %v, errors %v", readers, rights.Errors)
 	}
 }
