@@ -5,14 +5,17 @@ package main
 import (
 	"bytes"
 	"encoding/asn1"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -32,6 +35,7 @@ import (
 	"github.com/oiweiwei/gokrb5.fork/v9/gssapi"
 	"github.com/oiweiwei/gokrb5.fork/v9/iana/etypeID"
 	"github.com/oiweiwei/gokrb5.fork/v9/messages"
+	"github.com/oiweiwei/gokrb5.fork/v9/spnego"
 	"github.com/oiweiwei/gokrb5.fork/v9/test/testdata"
 	"github.com/oiweiwei/gokrb5.fork/v9/types"
 )
@@ -72,23 +76,6 @@ func userValues(rid string, control string, groups, universal []string) map[stri
 		values["tokenGroupsGlobalAndUniversal"] = append(values["tokenGroupsGlobalAndUniversal"], sidBytes(sid))
 	}
 	return values
-}
-
-func TestUnder(t *testing.T) {
-	for sid, want := range map[string]bool{
-		"S-1-5-21-1-2-34-500":  false,
-		"S-1-5-21-1-2-3-500":   true,
-		"S-1-5-21-1-2-3-500-1": false,
-		"S-1-5-21-1-2-3":       false,
-		"S-1-5-21-1-2-3-":      false,
-	} {
-		if got := under(sid, testDomain); got != want {
-			t.Errorf("under(%s) = %v, want %v", sid, got, want)
-		}
-	}
-	if under("S-1-5-21-1-2-3-500", "") {
-		t.Error("an empty domain matched")
-	}
 }
 
 func TestTokenAbsent(t *testing.T) {
@@ -490,7 +477,7 @@ func TestNoNTLMOrGlobalStore(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, forbidden := range []string{"ssp.NTLM", "NTLMCredential", "gssapi.AddMechanism", "gssapi.AddCredential", "NTLMBind"} {
+		for _, forbidden := range []string{"ssp.NTLM", "NTLMCredential", "gssapi.AddMechanism", "gssapi.AddCredential", "NTLMBind", "spnego.NewClient", "SetSPNEGOHeader", "ContextFlagDeleg", "func under("} {
 			if bytes.Contains(content, []byte(forbidden)) {
 				t.Errorf("%s uses %s", name, forbidden)
 			}
@@ -768,8 +755,8 @@ func TestAPRep(t *testing.T) {
 	}
 }
 
-func TestBindRequiresSealing(t *testing.T) {
-	raw, err := hex.DecodeString(strings.Replace(testdata.CCACHE_TEST, "59665b8e59665bce5967044e5967ad08", "00000001000000017ffffff07ffffff0", 1))
+func cachedClient(t *testing.T) (*client.Client, types.EncryptionKey) {
+	raw, err := hex.DecodeString(testdata.CCACHE_TEST)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -777,12 +764,19 @@ func TestBindRequiresSealing(t *testing.T) {
 	if err := cache.Unmarshal(raw); err != nil {
 		t.Fatal(err)
 	}
+	for _, entry := range cache.Credentials {
+		entry.EndTime, entry.RenewTill = time.Now().Add(time.Hour), time.Now().Add(time.Hour)
+	}
 	krb, err := client.NewFromCCacheOptionalTGT(&cache, config.New())
 	if err != nil {
 		t.Fatal(err)
 	}
 	ticketKey, _ := hex.DecodeString("fd325da3f905d743894e828de41b21af7876b6281b66d9e4bb2eefd64078b476")
-	session := types.EncryptionKey{KeyType: etypeID.AES256_CTS_HMAC_SHA1_96, KeyValue: ticketKey}
+	return krb, types.EncryptionKey{KeyType: etypeID.AES256_CTS_HMAC_SHA1_96, KeyValue: ticketKey}
+}
+
+func TestBindRequiresSealing(t *testing.T) {
+	krb, session := cachedClient(t)
 	for name, sealing := range map[string]bool{"success after AP-REP": false, "sealing negotiated": true} {
 		clientSide, serverSide := net.Pipe()
 		go func() {
@@ -833,6 +827,183 @@ func TestBindRequiresSealing(t *testing.T) {
 		}
 		if conn != nil {
 			conn.Close()
+		}
+	}
+}
+
+func TestNegotiate(t *testing.T) {
+	krb, session := cachedClient(t)
+	s := &linuxSource{ldap: krb}
+	first, err := s.Negotiate("HTTP/host.test.gokrb5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.Negotiate("HTTP/host.test.gokrb5")
+	if err != nil || second == first {
+		t.Fatalf("second token: %v, fresh %v", err, second != first)
+	}
+	raw, err := base64.StdEncoding.DecodeString(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.KerberosToken(raw); err != nil {
+		t.Fatal(err)
+	}
+	var token spnego.SPNEGOToken
+	if err := token.Unmarshal(raw); err != nil || !token.Init {
+		t.Fatalf("not a NegTokenInit: %v", err)
+	}
+	if mechs := token.NegTokenInit.MechTypes; len(mechs) != 1 || !mechs[0].Equal(gssapi.OIDKRB5.OID()) {
+		t.Fatalf("mechTypes %v", mechs)
+	}
+	var mech spnego.KRB5Token
+	if err := mech.Unmarshal(token.NegTokenInit.MechTokenBytes); err != nil || !mech.IsAPReq() {
+		t.Fatalf("mechanism token: %v", err)
+	}
+	if err := mech.APReq.DecryptAuthenticator(session); err != nil {
+		t.Fatal(err)
+	}
+	checksum := mech.APReq.Authenticator.Cksum.Checksum
+	if len(checksum) != 24 || binary.LittleEndian.Uint32(checksum[20:]) != uint32(gssapi.ContextFlagInteg|gssapi.ContextFlagConf) {
+		t.Fatalf("authenticator checksum %x asks for more than integrity and confidentiality", checksum)
+	}
+	if _, err := s.Negotiate("HTTP/nosuch"); !errors.Is(err, core.ErrUnavailable) || !strings.Contains(err.Error(), "HTTP/nosuch") {
+		t.Fatalf("unknown SPN: %v", err)
+	}
+}
+
+type directoryAnswer struct {
+	entries []map[string][][]byte
+	code    int64
+}
+
+func fakeDirectory(t *testing.T, answers map[string]directoryAnswer) (*ldap.Conn, *[]string) {
+	clientSide, serverSide := net.Pipe()
+	asked := []string{}
+	go func() {
+		defer serverSide.Close()
+		for {
+			request, err := ber.ReadPacket(serverSide)
+			if err != nil || request.Children[1].Tag != ldap.ApplicationSearchRequest {
+				return
+			}
+			base := request.Children[1].Children[0].Data.String()
+			filter, _ := ldap.DecompileFilter(request.Children[1].Children[6])
+			asked = append(asked, base+" "+filter)
+			answer, ok := answers[base]
+			if !ok {
+				answer.code = ldap.LDAPResultNoSuchObject
+			}
+			envelope := func(op *ber.Packet) []byte {
+				packet := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "")
+				packet.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, request.Children[0].Value, ""))
+				packet.AppendChild(op)
+				return packet.Bytes()
+			}
+			for _, values := range answer.entries {
+				entry := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ldap.ApplicationSearchResultEntry, nil, "")
+				entry.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, base, ""))
+				attributes := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "")
+				for name, list := range values {
+					attribute := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "")
+					attribute.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, name, ""))
+					set := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSet, nil, "")
+					for _, value := range list {
+						set.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, string(value), ""))
+					}
+					attribute.AppendChild(set)
+					attributes.AppendChild(attribute)
+				}
+				entry.AppendChild(attributes)
+				serverSide.Write(envelope(entry))
+			}
+			done := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ldap.ApplicationSearchResultDone, nil, "")
+			done.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagEnumerated, answer.code, ""))
+			done.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", ""))
+			done.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", ""))
+			serverSide.Write(envelope(done))
+		}
+	}()
+	conn := ldap.NewConn(clientSide, false)
+	conn.Start()
+	t.Cleanup(func() { conn.Close() })
+	return conn, &asked
+}
+
+func TestMembers(t *testing.T) {
+	const base = "DC=samdom,DC=example,DC=com"
+	const configuration = "CN=Configuration," + base
+	const partitions = "CN=Partitions," + configuration
+	crossRef := partitions + " (&(objectClass=crossRef)(nCName=" + base + "))"
+	object := func(rid string, classes ...string) map[string][][]byte {
+		values := map[string][][]byte{
+			"objectSid":      {sidBytes(testDomain + "-" + rid)},
+			"sAMAccountName": {[]byte("Alice")},
+			"tokenGroups":    {sidBytes(testDomain + "-513"), sidBytes(testDomain + "-2001")},
+		}
+		for _, class := range classes {
+			values["objectClass"] = append(values["objectClass"], []byte(class))
+		}
+		return values
+	}
+	naming := map[string]directoryAnswer{
+		base:       {entries: []map[string][][]byte{{"objectSid": {sidBytes(testDomain)}}}},
+		"":         {entries: []map[string][][]byte{{"configurationNamingContext": {[]byte(configuration)}}}},
+		partitions: {entries: []map[string][][]byte{{"nETBIOSName": {[]byte("SAMDOM")}}}},
+	}
+	answers := maps.Clone(naming)
+	answers["<SID="+testDomain+"-1105>"] = directoryAnswer{entries: []map[string][][]byte{object("1105", "top", "person", "organizationalPerson", "user")}}
+	answers["<SID="+testDomain+"-1107>"] = directoryAnswer{entries: []map[string][][]byte{object("1107", "top", "group")}}
+	answers["<SID="+testDomain+"-1108>"] = directoryAnswer{entries: []map[string][][]byte{object("1108", "top", "person", "organizationalPerson", "user", "computer")}}
+	answers["<SID="+testDomain+"-1109>"] = directoryAnswer{}
+	conn, asked := fakeDirectory(t, answers)
+	s := &linuxSource{}
+	sids := []string{testDomain + "-1105", testDomain + "-1106", testDomain + "-1107", testDomain + "-1108", testDomain + "-1109", testMember + "-1105", "S-1-5-32-544", testDomain}
+	members, err := s.members(conn, base, sids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alice := core.Member{Login: `i:0#.w|samdom\alice`, SID: "s-1-5-21-1-2-3-1105", SIDs: []string{"s-1-5-21-1-2-3-1105", "s-1-5-21-1-2-3-513", "s-1-5-21-1-2-3-2001"}}
+	want := make([]core.Member, len(sids))
+	want[0] = alice
+	if !reflect.DeepEqual(members, want) {
+		t.Fatalf("members %+v", members)
+	}
+	first := []string{base + " (objectClass=*)", " (objectClass=*)", crossRef}
+	for _, rid := range []string{"1105", "1106", "1107", "1108", "1109"} {
+		first = append(first, "<SID="+testDomain+"-"+rid+"> (objectClass=*)")
+	}
+	if !slices.Equal(*asked, first) {
+		t.Fatalf("searches %q", *asked)
+	}
+	if members, err = s.members(conn, base, sids[:1]); err != nil || !reflect.DeepEqual(members, want[:1]) || len(*asked) != len(first)+1 {
+		t.Fatalf("cached naming: %+v %v, searches %q", members, err, *asked)
+	}
+
+	failing := maps.Clone(naming)
+	failing["<SID="+testDomain+"-1105>"] = directoryAnswer{code: ldap.LDAPResultBusy}
+	conn, _ = fakeDirectory(t, failing)
+	if members, err := (&linuxSource{}).members(conn, base, sids[:2]); !errors.Is(err, core.ErrUnavailable) || members != nil {
+		t.Fatalf("busy directory: %+v %v", members, err)
+	}
+
+	for name, broken := range map[string]map[string]directoryAnswer{
+		"no netbios name":    {partitions: {}},
+		"two crossRefs":      {partitions: {entries: []map[string][][]byte{{"nETBIOSName": {[]byte("SAMDOM")}}, {"nETBIOSName": {[]byte("OTHER")}}}}},
+		"empty netbios name": {partitions: {entries: []map[string][][]byte{{"nETBIOSName": {[]byte("")}}}}},
+		"no configuration":   {"": {entries: []map[string][][]byte{{}}}},
+		"no domain sid":      {base: {entries: []map[string][][]byte{{}}}},
+	} {
+		answers := maps.Clone(naming)
+		maps.Copy(answers, broken)
+		answers["<SID="+testDomain+"-1105>"] = directoryAnswer{entries: []map[string][][]byte{object("1105", "user")}}
+		conn, asked := fakeDirectory(t, answers)
+		s := &linuxSource{}
+		if members, err := s.members(conn, base, sids[:1]); !errors.Is(err, core.ErrUnavailable) || members != nil {
+			t.Errorf("%s: %+v %v", name, members, err)
+		}
+		if slices.ContainsFunc(*asked, func(search string) bool { return strings.HasPrefix(search, "<SID=") }) || s.domainSID != "" || s.netbios != "" {
+			t.Errorf("%s: searched members or cached naming: %q", name, *asked)
 		}
 	}
 }
