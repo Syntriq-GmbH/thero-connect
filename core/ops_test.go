@@ -1236,6 +1236,42 @@ func TestWalkLinkWithoutReferralIncomplete(t *testing.T) {
 	}
 }
 
+func TestFirstWalkReadsEmittedPages(t *testing.T) {
+	sd := readable("S-1-1-0")
+	src := newFakeSource()
+	namespace(src)
+	for i := range pageSize {
+		src.add(fmt.Sprintf(`\\fs1.corp\ns\f%03d.txt`, i), "x", sd)
+	}
+	src.links[`\\fs1.corp\ns\docs`] = true
+	refer(src, `\\fs1.corp\ns\docs`, []string{`\\fs2.corp\docs`})
+	linked := src.add(`\\fs2.corp\docs\x.txt`, "linked", sd)
+	a := dfsAgent(t, src, root{ID: "ns", Path: `\\fs1.corp\ns`})
+	first := a.walk(message{Type: "walk", ID: 1, Root: "ns"}).(pageMessage)
+	if len(first.Entries) != pageSize || first.Cursor == "" {
+		t.Fatalf("first page has %d entries, cursor %q", len(first.Entries), first.Cursor)
+	}
+	emitted := src.files[`\\fs1.corp\ns\`+strings.ReplaceAll(first.Entries[0].Path, "/", `\`)]
+	linkedRead := message{Type: "read", ID: 3, Root: "ns", Path: "docs/x.txt", File: fmt.Sprintf("%016x", linked.id^bind(`\\fs2.corp\docs`)), Size: 6, Modified: linked.modified.UnixMilli()}
+	if reply := a.read(t.Context(), linkedRead, openWindow(), func([]byte) error { return nil }); codeOfReply(reply) != "unavailable" {
+		t.Fatalf("read through an unverified link answered %+v", reply)
+	}
+	second := make(chan any)
+	go func() { second <- a.walk(message{Type: "walk", ID: 2, Root: "ns", Cursor: first.Cursor}) }()
+	if data, reply := readFile(a, "ns", first.Entries[0].Path, emitted); codeOfReply(reply) != "done" || data == "" {
+		t.Fatalf("read of a first page record answered %q %+v", data, reply)
+	}
+	if page := (<-second).(pageMessage); page.Cursor != "" {
+		t.Fatalf("second page cursor %q", page.Cursor)
+	}
+	if _, err := os.Stat(statePath(a.dir, "mounts.json")); err != nil {
+		t.Fatal(err)
+	}
+	if reply := a.read(t.Context(), linkedRead, openWindow(), func([]byte) error { return nil }); codeOfReply(reply) != "done" {
+		t.Fatalf("read through the verified link answered %+v", reply)
+	}
+}
+
 func TestRootPathChangeDropsState(t *testing.T) {
 	alice := "S-1-5-21-1-2-3-1104"
 	src := newFakeSource()

@@ -95,6 +95,7 @@ type walkState struct {
 	dirs       []pendingFile
 	files      []pendingFile
 	mounts     map[string]string
+	listedDirs map[string]bool
 	taken      map[string]bool
 	seen       map[string]bool
 	next       map[string]cachedClass
@@ -313,8 +314,10 @@ func (a *agent) walk(m message) any {
 	if m.Cursor == "" {
 		nonce := make([]byte, 8)
 		rand.Read(nonce)
-		w = &walkState{nonce: hex.EncodeToString(nonce), started: a.now(), dirs: []pendingFile{{item: Entry{Dir: true, Link: true}}}, mounts: map[string]string{}, taken: map[string]bool{}, seen: map[string]bool{}, next: map[string]cachedClass{}}
+		w = &walkState{nonce: hex.EncodeToString(nonce), started: a.now(), dirs: []pendingFile{{item: Entry{Dir: true, Link: true}}}, mounts: map[string]string{}, listedDirs: map[string]bool{}, taken: map[string]bool{}, seen: map[string]bool{}, next: map[string]cachedClass{}}
+		a.mu.Lock()
 		a.walks[r.ID] = w
+		a.mu.Unlock()
 	}
 	if w == nil || m.Cursor != w.cursor {
 		return failure(m.ID, "cursor", "unknown walk cursor")
@@ -384,7 +387,9 @@ func (a *agent) walk(m message) any {
 			var target string
 			target, items, err = a.locate(path, pins[dir], w.taken, &budget)
 			if err == nil {
+				a.mu.Lock()
 				w.mounts[dir] = target
+				a.mu.Unlock()
 				lower := strings.ToLower(target)
 				for i := len(lower); i > 2; i = strings.LastIndex(lower[:i], `\`) {
 					w.taken[lower[:i]] = w.taken[lower[:i]] || i == len(lower)
@@ -392,8 +397,8 @@ func (a *agent) walk(m message) any {
 			}
 		}
 		if err != nil && dir == "" {
-			delete(a.walks, r.ID)
 			a.mu.Lock()
+			delete(a.walks, r.ID)
 			delete(a.walked, r.ID)
 			a.save("walks.json", a.walked)
 			a.mu.Unlock()
@@ -409,6 +414,9 @@ func (a *agent) walk(m message) any {
 			w.incomplete++
 			continue
 		}
+		a.mu.Lock()
+		w.listedDirs[dir] = true
+		a.mu.Unlock()
 		for _, item := range items {
 			rel := item.Name
 			if dir != "" {
@@ -433,9 +441,9 @@ func (a *agent) walk(m message) any {
 		w.page++
 		w.cursor = fmt.Sprintf("%s-%d", w.nonce, w.page)
 	} else {
-		delete(a.walks, r.ID)
 		a.cache[r.ID] = w.next
 		a.mu.Lock()
+		delete(a.walks, r.ID)
 		for id, entry := range a.classes {
 			if entry.Root == r.ID && !w.seen[id] {
 				delete(a.classes, id)
@@ -622,11 +630,14 @@ func (a *agent) read(ctx context.Context, m message, t *transfer, frame func([]b
 	}
 	a.mu.Lock()
 	table := a.mounts[r.ID]
+	if running := a.walks[r.ID]; table.Path != r.Path && running != nil && running.listedDirs[m.Path[:max(strings.LastIndex(m.Path, "/"), 0)]] {
+		table = mountTable{Path: r.Path, Targets: running.mounts}
+	}
+	target, rest, key := physical(table.Targets, r.Path, m.Path)
 	a.mu.Unlock()
 	if table.Path != r.Path {
 		return refuse("unavailable")
 	}
-	target, rest, key := physical(table.Targets, r.Path, m.Path)
 	if rest == "" {
 		return refuse("not_found")
 	}
