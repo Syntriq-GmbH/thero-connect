@@ -156,3 +156,4 @@ Lab checks. Each has a default that can only remove readers; a result that disag
 - L14: `GetUserEffectivePermissions` honours the restricted permission set of the web application. If not, that web application gets no readers.
 - L15: whether `$value` downloads create audit or usage analytics entries. Record the result in `README.md`.
 - L16: `$expand=AttachmentFiles` together with `p_ID` paging works on 2016. If not, generic lists are `incomplete`.
+- L17: `GetFileById(...)/$value` answers with the same `ETag` as the file's `ETag` property and refuses a stale `If-Match` with `412`. A missing or different `ETag` makes every library read `changed`; a farm that ignores `If-Match` is still covered by the client's own comparison.

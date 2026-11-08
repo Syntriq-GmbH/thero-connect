@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"maps"
 	"net"
@@ -92,6 +93,7 @@ type farm struct {
 	fault    func(r *http.Request) *farmFault
 	delay    func(r *http.Request) time.Duration
 	onValue  func()
+	noMatch  bool
 	control  func(step string) bool
 	chunked  bool
 	requests []farmRequest
@@ -300,7 +302,7 @@ var (
 	listRoute  = regexp.MustCompile(`^web/lists\(guid'([0-9a-f-]+)'\)(/fields|/items|/items\((\d+)\))?$`)
 	scopeRoute = regexp.MustCompile(`^web(?:/lists\(guid'([0-9a-f-]+)'\)(?:/items\((\d+)\))?)?/(roleassignments|getusereffectivepermissions\(@u\))$`)
 	groupRoute = regexp.MustCompile(`^web/sitegroups/getbyid\((\d+)\)/users$`)
-	byIDRoute  = regexp.MustCompile(`^web/GetFileById\('([0-9a-f-]+)'\)/\$value$`)
+	byIDRoute  = regexp.MustCompile(`^web/GetFileById\('([0-9a-f-]+)'\)(/\$value)?$`)
 	byURLRoute = regexp.MustCompile(`^web/GetFileByServerRelativeUrl\('(.*)'\)(/\$value)?$`)
 )
 
@@ -335,6 +337,10 @@ func (f *farm) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			io.WriteString(w, fault.body)
 			return
 		}
+	}
+	if strings.HasSuffix(r.URL.Path, "/$value") && f.onValue != nil {
+		f.onValue()
+		f.onValue = nil
 	}
 	var web *farmWeb
 	for _, candidate := range f.webs {
@@ -417,13 +423,24 @@ func (f *farm) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		values(members)
 	case byIDRoute.MatchString(rest):
-		unique := byIDRoute.FindStringSubmatch(rest)[1]
+		match := byIDRoute.FindStringSubmatch(rest)
 		for _, l := range f.lists {
 			for _, row := range l.rows {
-				if row.props["UniqueId"] == unique && l.web == web {
-					f.value(w, row.content)
+				if row.props["UniqueId"] != match[1] || l.web != web {
+					continue
+				}
+				etag := fmt.Sprintf(`"{%s},%d"`, strings.ToUpper(match[1]), crc32.ChecksumIEEE([]byte(fmt.Sprint(row.props["OData__UIVersion"], row.content))))
+				if match[2] == "" {
+					send(map[string]any{"ETag": etag, "UIVersion": row.props["OData__UIVersion"]})
 					return
 				}
+				if r.Header.Get("If-Match") != etag && !f.noMatch {
+					w.WriteHeader(http.StatusPreconditionFailed)
+					return
+				}
+				w.Header().Set("ETag", etag)
+				f.value(w, row.content)
+				return
 			}
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -452,10 +469,6 @@ func (f *farm) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *farm) value(w http.ResponseWriter, content string) {
-	if f.onValue != nil {
-		f.onValue()
-		f.onValue = nil
-	}
 	if !f.chunked {
 		io.WriteString(w, content)
 		return
@@ -1747,6 +1760,28 @@ func TestSiteRead(t *testing.T) {
 	}
 }
 
+func TestSiteReadDraftAfterInfo(t *testing.T) {
+	for _, enforced := range []bool{true, false} {
+		f, src, docs := basicFarm(t)
+		row := f.file(docs, "plan.txt", "approved")
+		a := f.agent(src)
+		walk := walkSite(t, a, false)
+		f.update(func() {
+			f.noMatch = !enforced
+			f.onValue = func() {
+				row.content = "private draft bytes"
+				row.props["OData__UIVersion"], row.props["OData__Level"] = 513, 2
+			}
+		})
+		if data, code := readSite(a, walk.entries["Shared Documents/plan.txt"]); code != "changed" || data != "" {
+			t.Errorf("server enforces If-Match %t: answered %s with %q", enforced, code, data)
+		}
+		if f.count("$value") != 1 {
+			t.Errorf("server enforces If-Match %t: %d content requests", enforced, f.count("$value"))
+		}
+	}
+}
+
 func TestRequestRules(t *testing.T) {
 	f, src, docs := basicFarm(t)
 	f.file(docs, "a.txt", "x")
@@ -1839,12 +1874,12 @@ func TestRequestRules(t *testing.T) {
 	}
 	fault(func(int) *farmFault { return nil })
 	for _, p := range []string{"/sites/hr/Shared%20Documents/_api/web", "//sites/hr/_api/web", "/sites/hr/_api/../../x/_api/web", "/sites/hrx/_api/web", "/other/_api/web"} {
-		if _, err := a.sites.do(context.Background(), r, http.MethodGet, p, nil); err == nil {
+		if _, err := a.sites.do(context.Background(), r, http.MethodGet, p, "", nil); err == nil {
 			t.Errorf("GET %s was sent", p)
 		}
 	}
 	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch, "MERGE"} {
-		if _, err := a.sites.do(context.Background(), r, method, "/sites/hr/_api/web/lists", nil); err == nil {
+		if _, err := a.sites.do(context.Background(), r, method, "/sites/hr/_api/web/lists", "", nil); err == nil {
 			t.Errorf("%s was sent", method)
 		}
 	}

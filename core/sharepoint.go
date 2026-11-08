@@ -56,6 +56,7 @@ var (
 	}
 	errCursor     = errors.New("cursor")
 	errBadRequest = errors.New("bad request")
+	errChanged    = errors.New("changed")
 	guidPattern   = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 	fieldKey      = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	fieldTypes    = map[string]bool{"Text": true, "Note": true, "Number": true, "Integer": true, "Currency": true, "DateTime": true, "Boolean": true, "Choice": true, "MultiChoice": true, "URL": true}
@@ -339,7 +340,7 @@ func retryAfter(header string, wait int) time.Duration {
 	return min(max(delay, 0), 30*time.Second)
 }
 
-func (s *sites) do(ctx context.Context, r root, method, requestPath string, body []byte) (*http.Response, error) {
+func (s *sites) do(ctx context.Context, r root, method, requestPath, match string, body []byte) (*http.Response, error) {
 	site, _ := url.Parse(r.URL)
 	raw, query, _ := strings.Cut(requestPath, "?")
 	decoded, err := url.PathUnescape(raw)
@@ -368,6 +369,9 @@ func (s *sites) do(ctx context.Context, r root, method, requestPath string, body
 		req.Header.Set("Accept", "application/json;odata=nometadata")
 		req.Header.Set("X-FORMS_BASED_AUTH_ACCEPTED", "f")
 		req.Header.Set("User-Agent", "Thero-Connect/"+version)
+		if match != "" {
+			req.Header.Set("If-Match", match)
+		}
 		if method == http.MethodPost {
 			req.Header.Set("Content-Type", "application/json;odata=verbose")
 			if digest != "" {
@@ -411,6 +415,8 @@ func (s *sites) do(ctx context.Context, r root, method, requestPath string, body
 			return nil, s.failed(r, ErrDenied)
 		case status == http.StatusNotFound:
 			return nil, ErrNotFound
+		case status == http.StatusPreconditionFailed:
+			return nil, errChanged
 		case status == http.StatusBadRequest:
 			return nil, s.failed(r, errBadRequest)
 		case status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable:
@@ -437,7 +443,7 @@ func (s *sites) failed(r root, err error) error {
 func (s *sites) get(ctx context.Context, r root, method, requestPath string, body []byte, target any) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
-	resp, err := s.do(ctx, r, method, requestPath, body)
+	resp, err := s.do(ctx, r, method, requestPath, "", body)
 	if err != nil {
 		return err
 	}
@@ -1708,6 +1714,7 @@ type siteFile struct {
 	path   string
 	body   io.ReadCloser
 	text   []byte
+	etag   string
 	offset int64
 }
 
@@ -1754,6 +1761,22 @@ func (f *siteFile) Info() (FileInfo, error) {
 		return changed, nil
 	}
 	size, modified := now.Size, now.Modified
+	if l.Library && e.Name == "" {
+		if !guidPattern.MatchString(e.UniqueID) {
+			return FileInfo{}, ErrNotFound
+		}
+		var props struct {
+			ETag      string
+			UIVersion *num
+		}
+		if err := f.s.get(f.ctx, f.r, http.MethodGet, apiPath(web, "web/GetFileById('"+e.UniqueID+"')?$select=ETag,UIVersion"), nil, &props); err != nil {
+			return FileInfo{}, err
+		}
+		if props.ETag == "" || props.UIVersion == nil || int64(*props.UIVersion) != e.Version {
+			return changed, nil
+		}
+		f.etag = props.ETag
+	}
 	if e.Name != "" {
 		var props struct {
 			Length           *num
@@ -1784,14 +1807,23 @@ func (f *siteFile) ReadAt(p []byte, off int64) (int, error) {
 		switch {
 		case !l.Library && e.Name == "":
 			f.body = io.NopCloser(bytes.NewReader(f.text))
-		case l.Library && !guidPattern.MatchString(e.UniqueID):
-			return 0, ErrNotFound
-		default:
-			target := fileByURL(strings.TrimSuffix(f.b.path, "/") + "/" + f.path)
-			if l.Library {
-				target = "web/GetFileById('" + e.UniqueID + "')"
+		case l.Library && f.etag == "":
+			return 0, io.EOF
+		case l.Library:
+			resp, err := f.s.do(f.ctx, f.r, http.MethodGet, apiPath(f.b.webs[l.Web].URL, "web/GetFileById('"+e.UniqueID+"')/$value"), f.etag, nil)
+			if errors.Is(err, errChanged) {
+				return 0, io.EOF
 			}
-			resp, err := f.s.do(f.ctx, f.r, http.MethodGet, apiPath(f.b.webs[l.Web].URL, target+"/$value"), nil)
+			if err != nil {
+				return 0, err
+			}
+			if resp.Header.Get("ETag") != f.etag {
+				resp.Body.Close()
+				return 0, io.EOF
+			}
+			f.body = resp.Body
+		default:
+			resp, err := f.s.do(f.ctx, f.r, http.MethodGet, apiPath(f.b.webs[l.Web].URL, fileByURL(strings.TrimSuffix(f.b.path, "/")+"/"+f.path)+"/$value"), "", nil)
 			if err != nil {
 				return 0, err
 			}
