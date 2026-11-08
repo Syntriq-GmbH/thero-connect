@@ -4,28 +4,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
-	"maps"
-	"net"
-	"os"
-	"path/filepath"
-	"reflect"
-	"slices"
-	"strconv"
-	"strings"
-	"testing"
-	"time"
-
 	"github.com/Syntriq-GmbH/thero-connect/core"
 	ber "github.com/go-asn1-ber/asn1-ber"
 	ldap "github.com/go-ldap/ldap/v3"
+	"github.com/hirochachacha/go-smb2/v2/auth"
 	"github.com/hirochachacha/go-smb2/v2/x/protocol"
+	"github.com/hirochachacha/go-smb2/v2/x/wire"
 	"github.com/oiweiwei/go-msrpc/msrpc/dtyp"
 	"github.com/oiweiwei/go-msrpc/msrpc/srvs/srvsvc/v3"
 	"github.com/oiweiwei/gokrb5.fork/v9/client"
@@ -38,6 +29,18 @@ import (
 	"github.com/oiweiwei/gokrb5.fork/v9/spnego"
 	"github.com/oiweiwei/gokrb5.fork/v9/test/testdata"
 	"github.com/oiweiwei/gokrb5.fork/v9/types"
+	"io"
+	"maps"
+	"net"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
 )
 
 const (
@@ -1006,5 +1009,124 @@ func TestMembers(t *testing.T) {
 		if slices.ContainsFunc(*asked, func(search string) bool { return strings.HasPrefix(search, "<SID=") }) || s.domainSID != "" || s.netbios != "" {
 			t.Errorf("%s: searched members or cached naming: %q", name, *asked)
 		}
+	}
+}
+
+func offline() *linuxSource {
+	return &linuxSource{domain: "corp.example", smb: &auth.KerberosCredential{}, dialing: map[string]*sync.Mutex{}, connections: map[string]*connection{}, down: map[string]time.Time{}}
+}
+
+func TestDFSLink(t *testing.T) {
+	directory, reparse := uint32(wire.FILE_ATTRIBUTE_DIRECTORY), uint32(wire.FILE_ATTRIBUTE_REPARSE_POINT)
+	tests := []struct {
+		attributes, tag uint32
+		want            bool
+	}{
+		{directory | reparse, wire.IO_REPARSE_TAG_DFS, true},
+		{directory | reparse | wire.FILE_ATTRIBUTE_READONLY | wire.FILE_ATTRIBUTE_ARCHIVE, wire.IO_REPARSE_TAG_DFS, true},
+		{directory | reparse, wire.IO_REPARSE_TAG_SYMLINK, false},
+		{directory | reparse, wire.IO_REPARSE_TAG_MOUNT_POINT, false},
+		{directory | reparse, 0, false},
+		{reparse, wire.IO_REPARSE_TAG_DFS, false},
+		{directory, wire.IO_REPARSE_TAG_DFS, false},
+		{0, wire.IO_REPARSE_TAG_DFS, false},
+		{directory | reparse | wire.FILE_ATTRIBUTE_OFFLINE, wire.IO_REPARSE_TAG_DFS, false},
+		{directory | reparse | attributeRecallOnOpen, wire.IO_REPARSE_TAG_DFS, false},
+		{directory | reparse | attributeRecallOnAccess, wire.IO_REPARSE_TAG_DFS, false},
+	}
+	for _, test := range tests {
+		if got := dfsLink(test.attributes, test.tag); got != test.want {
+			t.Errorf("attributes %#x tag %#x: %v", test.attributes, test.tag, got)
+		}
+	}
+}
+
+func TestDomainRefused(t *testing.T) {
+	s := offline()
+	ctx := context.Background()
+	for _, unc := range []string{`\\corp.example\ns`, `\\CORP.Example\ns\docs`} {
+		if _, _, err := s.tree(ctx, unc); !errors.Is(err, core.ErrUnavailable) {
+			t.Errorf("tree %s: %v", unc, err)
+		}
+		if _, err := s.List(unc); !errors.Is(err, core.ErrUnavailable) {
+			t.Errorf("list %s: %v", unc, err)
+		}
+		if _, _, err := s.Descriptor(unc + `\a.txt`); !errors.Is(err, core.ErrUnavailable) {
+			t.Errorf("descriptor %s: %v", unc, err)
+		}
+		if _, err := s.Open(unc, "a.txt"); !errors.Is(err, core.ErrUnavailable) {
+			t.Errorf("open %s: %v", unc, err)
+		}
+		if _, err := s.Share(unc); !errors.Is(err, core.ErrUnavailable) {
+			t.Errorf("share %s: %v", unc, err)
+		}
+	}
+	for _, server := range []string{"corp.example", "CORP.EXAMPLE"} {
+		if _, _, err := s.pipe(ctx, server, "srvsvc"); !errors.Is(err, core.ErrUnavailable) {
+			t.Errorf("pipe %s: %v", server, err)
+		}
+		for _, sids := range [][]string{nil, {testMember + "-1001"}} {
+			if _, err := s.Allowed(server, sids, [][]byte{{1}}); !errors.Is(err, core.ErrUnavailable) {
+				t.Errorf("allowed %s %v: %v", server, sids, err)
+			}
+		}
+	}
+	if len(s.down) != 0 || len(s.connections) != 0 || len(s.dialing) != 0 {
+		t.Errorf("the domain name was dialed: down %v connections %v dialing %v", s.down, s.connections, s.dialing)
+	}
+}
+
+func TestDeadHostMemo(t *testing.T) {
+	s := offline()
+	unc := `\\dead.corp.example\share`
+	if _, err := s.List(unc); !errors.Is(err, core.ErrUnavailable) || len(s.down) != 0 {
+		t.Fatalf("plain list: %v, memo %v", err, s.down)
+	}
+	if _, err := s.Referral(unc); !errors.Is(err, core.ErrUnavailable) || errors.Is(err, core.ErrNotFound) || strings.Contains(err.Error(), "unreachable since") {
+		t.Fatalf("first referral: %v", err)
+	}
+	failed := s.down["dead.corp.example"]
+	if failed.IsZero() {
+		t.Fatal("a failed referral dial is not remembered")
+	}
+	for _, path := range []string{unc, `\\DEAD.corp.example\other\x`} {
+		if _, err := s.Referral(path); !errors.Is(err, core.ErrUnavailable) || errors.Is(err, core.ErrNotFound) || !strings.Contains(err.Error(), "unreachable since") {
+			t.Errorf("referral to a remembered host %s: %v", path, err)
+		}
+	}
+	if _, err := s.List(unc); !errors.Is(err, core.ErrUnavailable) || strings.Contains(err.Error(), "unreachable since") {
+		t.Errorf("plain list of a remembered host: %v", err)
+	}
+	if !s.down["dead.corp.example"].Equal(failed) {
+		t.Error("the memo changed without a referral dial")
+	}
+	s.down["dead.corp.example"] = time.Now().Add(-downTime - time.Second)
+	if _, err := s.Referral(unc); !errors.Is(err, core.ErrUnavailable) || strings.Contains(err.Error(), "unreachable since") {
+		t.Errorf("referral after the memo expired: %v", err)
+	}
+	if time.Since(s.down["dead.corp.example"]) > time.Minute {
+		t.Error("an expired memo is not renewed by a failed dial")
+	}
+	if _, err := s.Referral(`\\other.corp.example\share`); err == nil || strings.Contains(err.Error(), "unreachable since") {
+		t.Errorf("another host is refused by the memo: %v", err)
+	}
+	if len(s.down) != 2 {
+		t.Errorf("memo %v", s.down)
+	}
+}
+
+func TestReferralRefusals(t *testing.T) {
+	s := offline()
+	for _, unc := range []string{`\\fs1\ns`, `\\10.0.0.5\ns`, `\\dead.corp.example\ns\docs`} {
+		if _, err := s.Referral(unc); !errors.Is(err, core.ErrUnavailable) || errors.Is(err, core.ErrNotFound) || errors.Is(err, core.ErrDenied) {
+			t.Errorf("%s: %v", unc, err)
+		}
+	}
+	s.domain = "corp.invalid"
+	if _, err := s.Referral(`\\CORP.invalid\ns`); !errors.Is(err, core.ErrUnavailable) || errors.Is(err, core.ErrNotFound) {
+		t.Errorf("domain without domain controllers: %v", err)
+	}
+	if _, ok := s.down["corp.invalid"]; ok || len(s.connections) != 0 {
+		t.Errorf("the domain name was dialed: %v", s.down)
 	}
 }

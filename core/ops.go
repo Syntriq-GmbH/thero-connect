@@ -1,6 +1,7 @@
 package core
 
 import (
+	"cmp"
 	"context"
 	"crypto/ecdsa"
 	"crypto/rand"
@@ -14,21 +15,29 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"os"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 const (
-	pageSize    = 500
-	chunkSize   = 262144
-	ackWindow   = 4 << 20
-	readSlots   = 2
-	snapshotAge = 6 * time.Hour
+	pageSize     = 500
+	chunkSize    = 262144
+	ackWindow    = 4 << 20
+	readSlots    = 2
+	snapshotAge  = 6 * time.Hour
+	listTime     = 120 * time.Second
+	referralHops = 16
 )
+
+var mountLimit = 10000
+
+var errOverlap = errors.New("overlaps another mount")
 
 type agent struct {
 	dir     string
@@ -47,12 +56,19 @@ type agent struct {
 	walkMu  sync.Mutex
 	walks   map[string]*walkState
 	cache   map[string]map[string]cachedClass
+	mounts  map[string]mountTable
 	sites   *sites
 }
 
+type mountTable struct {
+	Path    string            `json:"path"`
+	Targets map[string]string `json:"targets"`
+}
+
 type classEntry struct {
-	Root string `json:"root"`
-	SD   []byte `json:"sd"`
+	Root   string `json:"root"`
+	Target string `json:"target,omitempty"`
+	SD     []byte `json:"sd"`
 }
 
 type quota struct {
@@ -61,6 +77,7 @@ type quota struct {
 }
 
 type cachedClass struct {
+	target  string
 	id      uint64
 	changed time.Time
 	class   string
@@ -76,8 +93,11 @@ type walkState struct {
 	nonce      string
 	started    time.Time
 	page       int
-	dirs       []string
+	dirs       []pendingFile
 	files      []pendingFile
+	mounts     map[string]string
+	listedDirs map[string]bool
+	taken      map[string]bool
 	seen       map[string]bool
 	next       map[string]cachedClass
 	listed     int
@@ -118,8 +138,9 @@ func newAgent(dir string, cfg config, src Source) (*agent, error) {
 		slots:   make(chan struct{}, readSlots),
 		walks:   map[string]*walkState{},
 		cache:   map[string]map[string]cachedClass{},
+		mounts:  map[string]mountTable{},
 	}
-	for name, target := range map[string]any{"classes.json": &a.classes, "quota.json": &a.quota, "walks.json": &a.walked} {
+	for name, target := range map[string]any{"classes.json": &a.classes, "quota.json": &a.quota, "walks.json": &a.walked, "mounts.json": &a.mounts} {
 		data, err := os.ReadFile(statePath(dir, name))
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
@@ -132,8 +153,28 @@ func newAgent(dir string, cfg config, src Source) (*agent, error) {
 		}
 	}
 	for id, entry := range a.classes {
-		if supported(entry.SD) != nil || classOf(entry.Root, entry.SD) != id {
+		if supported(entry.SD) != nil || classOf(scope(entry.Root, entry.Target), entry.SD) != id {
 			delete(a.classes, id)
+		}
+	}
+	for _, r := range cfg.Roots {
+		table, stored := a.mounts[r.ID]
+		_, walked := a.walked[r.ID]
+		targeted := false
+		for _, entry := range a.classes {
+			targeted = targeted || entry.Root == r.ID && entry.Target != ""
+		}
+		switch {
+		case !stored && walked && !targeted:
+			a.mounts[r.ID] = mountTable{Path: r.Path}
+		case stored && table.Path != r.Path:
+			delete(a.mounts, r.ID)
+			delete(a.walked, r.ID)
+			for id, entry := range a.classes {
+				if entry.Root == r.ID {
+					delete(a.classes, id)
+				}
+			}
 		}
 	}
 	if len(cfg.Roots) > 0 && cfg.Roots[0].URL != "" {
@@ -172,6 +213,90 @@ func join(rootPath, rel string) string {
 	return rootPath + `\` + strings.ReplaceAll(rel, "/", `\`)
 }
 
+func physical(mounts map[string]string, rootPath, rel string) (string, string, string) {
+	prefix := rel
+	for {
+		if target, ok := mounts[prefix]; ok {
+			key := shareOf(target)
+			if key == shareOf(rootPath) {
+				key = ""
+			}
+			return target, strings.TrimPrefix(strings.TrimPrefix(rel, prefix), "/"), key
+		}
+		if prefix == "" {
+			return rootPath, rel, ""
+		}
+		prefix = prefix[:max(strings.LastIndex(prefix, "/"), 0)]
+	}
+}
+
+func (a *agent) locate(unc, pin string, taken map[string]bool, budget *int) (string, []Entry, error) {
+	if *budget == 0 {
+		return "", nil, ErrUnavailable
+	}
+	top := *budget == referralHops
+	*budget--
+	ref, err := a.src.Referral(unc)
+	self := err == nil && slices.ContainsFunc(slices.Concat(ref.Sets...), func(target string) bool { return strings.EqualFold(target, ref.Consumed) })
+	if errors.Is(err, ErrNotFound) || self {
+		lower := strings.ToLower(unc)
+		_, overlap := taken[lower]
+		for i := strings.LastIndex(lower, `\`); i > 2 && !overlap; i = strings.LastIndex(lower[:i], `\`) {
+			overlap = taken[lower[:i]]
+		}
+		if overlap && top && !self {
+			return "", nil, ErrUnavailable
+		}
+		if overlap {
+			return "", nil, errOverlap
+		}
+		items, err := a.src.List(unc)
+		return unc, items, err
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	consumed := len(ref.Consumed)
+	if shareOf(ref.Consumed) == "" || strings.HasSuffix(ref.Consumed, `\`) || len(unc) < consumed || !strings.EqualFold(unc[:consumed], ref.Consumed) || len(unc) > consumed && unc[consumed] != '\\' {
+		return "", nil, ErrUnavailable
+	}
+	rest := unc[consumed:]
+	var candidates []string
+	for _, set := range ref.Sets {
+		sorted := slices.SortedFunc(slices.Values(set), func(x, y string) int {
+			return cmp.Or(strings.Compare(strings.ToLower(x), strings.ToLower(y)), strings.Compare(x, y))
+		})
+		for _, candidate := range sorted {
+			parts := strings.SplitN(candidate, `\`, 5)
+			if len(parts) < 4 || parts[0] != "" || parts[1] != "" || !validHost(parts[2]) {
+				continue
+			}
+			share := parts[3]
+			if share == "" || strings.ContainsAny(share, `/:*?"<>|@`) || strings.ContainsFunc(share, unicode.IsControl) || strings.TrimSpace(share) != share || share == "." || share == ".." || strings.EqualFold(share, "IPC$") {
+				continue
+			}
+			if len(parts) == 5 {
+				if _, err := validPath(strings.ReplaceAll(parts[4], `\`, "/")); err != nil || strings.Contains(parts[4], "/") {
+					continue
+				}
+			}
+			candidates = append(candidates, candidate)
+		}
+	}
+	if i := slices.IndexFunc(candidates, func(candidate string) bool { return strings.EqualFold(candidate+rest, pin) }); i > 0 {
+		candidates = slices.Concat(candidates[i:i+1], candidates[:i], candidates[i+1:])
+	}
+	err = ErrUnavailable
+	for _, candidate := range candidates {
+		target, items, failed := a.locate(candidate+rest, pin, taken, budget)
+		if failed == nil || !errors.Is(failed, ErrUnavailable) && !errors.Is(failed, ErrNotFound) {
+			return target, items, failed
+		}
+		err = failed
+	}
+	return "", nil, err
+}
+
 func parseWindow(window string) (int, int, error) {
 	from, to, ok := strings.Cut(window, "-")
 	start, startErr := time.Parse("15:04", from)
@@ -199,42 +324,50 @@ func (a *agent) walk(m message) any {
 	if m.Cursor == "" {
 		nonce := make([]byte, 8)
 		rand.Read(nonce)
-		w = &walkState{nonce: hex.EncodeToString(nonce), started: a.now(), dirs: []string{""}, seen: map[string]bool{}, next: map[string]cachedClass{}}
+		w = &walkState{nonce: hex.EncodeToString(nonce), started: a.now(), dirs: []pendingFile{{item: Entry{Dir: true, Link: true}}}, mounts: map[string]string{}, listedDirs: map[string]bool{}, taken: map[string]bool{}, seen: map[string]bool{}, next: map[string]cachedClass{}}
+		a.mu.Lock()
 		a.walks[r.ID] = w
+		a.mu.Unlock()
 	}
 	if w == nil || m.Cursor != w.cursor {
 		return failure(m.ID, "cursor", "unknown walk cursor")
 	}
+	a.mu.Lock()
+	pins := a.mounts[r.ID].Targets
+	a.mu.Unlock()
 	previous := a.cache[r.ID]
 	maxFile := int64(a.cfg.Limits.MaxFileMB) << 20
 	entries := []pageEntry{}
 	incomplete := []string{}
 	registryChanged := false
-	for len(entries) < pageSize && len(incomplete) < pageSize {
+	pageStart := a.now()
+	listings := 0
+	for len(entries) < pageSize && len(incomplete) < pageSize && (listings == 0 || a.now().Sub(pageStart) < listTime) {
 		if len(w.files) > 0 {
 			pending := w.files[0]
 			w.files = w.files[1:]
 			var class *string
+			target, rest, key := physical(w.mounts, r.Path, pending.rel)
 			cached, known := previous[pending.rel]
-			if known && cached.id == pending.item.ID && cached.changed.Equal(pending.item.Changed) {
+			if known && cached.target == key && cached.id == pending.item.ID && cached.changed.Equal(pending.item.Changed) {
 				class = &cached.class
-			} else if sd, handleID, err := a.src.Descriptor(join(r.Path, pending.rel)); err == nil && handleID == pending.item.ID && supported(sd) == nil {
-				id := classOf(r.ID, sd)
+			} else if sd, handleID, err := a.src.Descriptor(join(target, rest)); err == nil && handleID == pending.item.ID && supported(sd) == nil {
+				id := classOf(scope(r.ID, key), sd)
 				class = &id
 				a.mu.Lock()
 				if _, registered := a.classes[id]; !registered {
-					a.classes[id] = classEntry{Root: r.ID, SD: sd}
+					a.classes[id] = classEntry{Root: r.ID, Target: key, SD: sd}
 					registryChanged = true
 				}
 				a.mu.Unlock()
 			}
 			if class != nil {
 				w.seen[*class] = true
-				w.next[pending.rel] = cachedClass{id: pending.item.ID, changed: pending.item.Changed, class: *class}
+				w.next[pending.rel] = cachedClass{target: key, id: pending.item.ID, changed: pending.item.Changed, class: *class}
 			}
 			entries = append(entries, pageEntry{
 				Path:     pending.rel,
-				File:     fmt.Sprintf("%016x", pending.item.ID),
+				File:     fmt.Sprintf("%016x", pending.item.ID^bind(key)),
 				Size:     pending.item.Size,
 				Created:  max(0, pending.item.Created.UnixMilli()),
 				Modified: max(0, pending.item.Modified.UnixMilli()),
@@ -246,23 +379,54 @@ func (a *agent) walk(m message) any {
 		if len(w.dirs) == 0 {
 			break
 		}
-		dir := w.dirs[len(w.dirs)-1]
+		pending := w.dirs[len(w.dirs)-1]
 		w.dirs = w.dirs[:len(w.dirs)-1]
-		items, err := a.src.List(join(r.Path, dir))
+		listings++
+		dir := pending.rel
+		mount, rest, _ := physical(w.mounts, r.Path, dir)
+		path := join(mount, rest)
+		var items []Entry
+		var err error
+		switch {
+		case !pending.item.Link:
+			items, err = a.src.List(path)
+		case len(w.mounts) > mountLimit:
+			err = ErrUnavailable
+		default:
+			budget := referralHops
+			var target string
+			target, items, err = a.locate(path, pins[dir], w.taken, &budget)
+			if err == nil {
+				a.mu.Lock()
+				w.mounts[dir] = target
+				a.mu.Unlock()
+				lower := strings.ToLower(target)
+				for i := len(lower); i > 2; i = strings.LastIndex(lower[:i], `\`) {
+					w.taken[lower[:i]] = w.taken[lower[:i]] || i == len(lower)
+				}
+			}
+		}
 		if err != nil && dir == "" {
-			delete(a.walks, r.ID)
 			a.mu.Lock()
+			delete(a.walks, r.ID)
 			delete(a.walked, r.ID)
 			a.save("walks.json", a.walked)
 			a.mu.Unlock()
 			slog.Warn("walk failed", "root", r.ID, "code", codeOf(err))
 			return failure(m.ID, codeOf(err), "root listing failed")
 		}
+		if errors.Is(err, errOverlap) {
+			w.skipped++
+			continue
+		}
 		if err != nil {
 			incomplete = append(incomplete, dir)
 			w.incomplete++
 			continue
 		}
+		a.mu.Lock()
+		w.listedDirs[dir] = true
+		a.mu.Unlock()
 		for _, item := range items {
 			rel := item.Name
 			if dir != "" {
@@ -276,7 +440,7 @@ func (a *agent) walk(m message) any {
 				continue
 			}
 			if item.Dir {
-				w.dirs = append(w.dirs, rel)
+				w.dirs = append(w.dirs, pendingFile{rel: rel, item: item})
 				continue
 			}
 			w.files = append(w.files, pendingFile{rel: rel, item: item})
@@ -287,9 +451,9 @@ func (a *agent) walk(m message) any {
 		w.page++
 		w.cursor = fmt.Sprintf("%s-%d", w.nonce, w.page)
 	} else {
-		delete(a.walks, r.ID)
 		a.cache[r.ID] = w.next
 		a.mu.Lock()
+		delete(a.walks, r.ID)
 		for id, entry := range a.classes {
 			if entry.Root == r.ID && !w.seen[id] {
 				delete(a.classes, id)
@@ -298,8 +462,14 @@ func (a *agent) walk(m message) any {
 		}
 		a.walked[r.ID] = w.started
 		a.save("walks.json", a.walked)
+		a.mounts[r.ID] = mountTable{Path: r.Path, Targets: w.mounts}
+		a.save("mounts.json", a.mounts)
 		a.mu.Unlock()
-		slog.Info("walk complete", "root", r.ID, "listed", w.listed, "skipped", w.skipped, "incomplete", w.incomplete)
+		targets := map[string]bool{}
+		for _, target := range w.mounts {
+			targets[shareOf(target)] = true
+		}
+		slog.Info("walk complete", "root", r.ID, "listed", w.listed, "skipped", w.skipped, "incomplete", w.incomplete, "targets", len(targets))
 	}
 	if registryChanged {
 		a.mu.Lock()
@@ -309,11 +479,11 @@ func (a *agent) walk(m message) any {
 	return pageMessage{Type: "page", ID: m.ID, Cursor: w.cursor, Entries: entries, Incomplete: incomplete}
 }
 
-func (a *agent) open(ctx context.Context, r root, rel string, m message) (File, error) {
+func (a *agent) open(ctx context.Context, r root, target, rest string, m message) (File, error) {
 	if r.URL != "" {
 		return a.sites.open(ctx, r, m.Path)
 	}
-	return a.src.Open(r.Path, rel)
+	return a.src.Open(target, strings.ReplaceAll(rest, "/", `\`))
 }
 
 func (a *agent) principals(m message) any {
@@ -348,10 +518,8 @@ func (a *agent) access(m message) any {
 		ids = append(ids, id)
 		registry[id] = entry
 	}
-	walked := make(map[string]time.Time, len(a.walked))
-	for id, at := range a.walked {
-		walked[id] = at
-	}
+	walked := maps.Clone(a.walked)
+	mounts := maps.Clone(a.mounts)
 	a.mu.Unlock()
 	slices.Sort(ids)
 	readers := map[string][]int{}
@@ -386,57 +554,99 @@ func (a *agent) access(m message) any {
 			}
 			continue
 		}
-		if at, ok := walked[r.ID]; !ok || a.now().Sub(at) > snapshotAge {
+		table := mounts[r.ID]
+		if at, ok := walked[r.ID]; !ok || a.now().Sub(at) > snapshotAge || table.Path != r.Path {
 			errs = append(errs, rootError{Root: r.ID, Code: "unavailable"})
 			continue
 		}
-		share, err := a.src.Share(r.Path)
-		if err != nil {
-			errs = append(errs, rootError{Root: r.ID, Code: codeOf(err)})
-			continue
-		}
-		if supported(share) != nil {
-			errs = append(errs, rootError{Root: r.ID, Code: "unsupported"})
-			continue
-		}
-		shareACL, _, _ := readACL(share, binary.LittleEndian.Uint32(share[16:]))
-		if slices.ContainsFunc(shareACL, func(item ace) bool { return item.sid == "S-1-3-4" && item.flags&0x08 == 0 }) {
-			continue
-		}
-		server, _, _ := SplitUNC(r.Path)
-		shareRights, err := a.src.Allowed(server, m.SIDs, [][]byte{share})
-		if err != nil {
-			errs = append(errs, rootError{Root: r.ID, Code: codeOf(err)})
-			continue
-		}
-		var passing []int
-		var passingSIDs []string
-		for k, row := range shareRights {
-			if row[0] {
-				passing = append(passing, k)
-				passingSIDs = append(passingSIDs, m.SIDs[k])
+		failed := false
+		fail := func(code string) {
+			if !failed {
+				errs = append(errs, rootError{Root: r.ID, Code: code})
+				failed = true
 			}
 		}
-		var rootClasses []string
-		var descriptors [][]byte
+		byTarget := map[string][]string{}
 		for _, id := range ids {
 			if registry[id].Root == r.ID {
-				rootClasses = append(rootClasses, id)
-				descriptors = append(descriptors, registry[id].SD)
+				byTarget[registry[id].Target] = append(byTarget[registry[id].Target], id)
 			}
 		}
-		if len(passing) == 0 || len(rootClasses) == 0 {
-			continue
+		byServer := map[string][]string{}
+		shares := map[string][]byte{}
+		for _, key := range slices.Sorted(maps.Keys(byTarget)) {
+			sharePath := key
+			if key == "" {
+				physicalRoot := shareOf(table.Targets[""]) == shareOf(r.Path)
+				if table.Targets == nil {
+					_, err := a.src.Referral(r.Path)
+					physicalRoot = errors.Is(err, ErrNotFound)
+				}
+				if !physicalRoot {
+					fail("unavailable")
+					continue
+				}
+				sharePath = r.Path
+			}
+			share, err := a.src.Share(sharePath)
+			if err != nil {
+				fail(codeOf(err))
+				continue
+			}
+			if supported(share) != nil {
+				fail("unsupported")
+				continue
+			}
+			shareACL, _, _ := readACL(share, binary.LittleEndian.Uint32(share[16:]))
+			if slices.ContainsFunc(shareACL, func(item ace) bool { return item.sid == "S-1-3-4" && item.flags&0x08 == 0 }) {
+				continue
+			}
+			server, _, _ := SplitUNC(sharePath)
+			byServer[server] = append(byServer[server], key)
+			shares[key] = share
 		}
-		matrix, err := a.src.Allowed(server, passingSIDs, descriptors)
-		if err != nil {
-			errs = append(errs, rootError{Root: r.ID, Code: codeOf(err)})
-			continue
-		}
-		for j, id := range rootClasses {
-			for k, index := range passing {
-				if matrix[k][j] {
-					readers[id] = append(readers[id], index)
+		for _, server := range slices.Sorted(maps.Keys(byServer)) {
+			keys := byServer[server]
+			shareDescriptors := make([][]byte, len(keys))
+			for c, key := range keys {
+				shareDescriptors[c] = shares[key]
+			}
+			shareRights, err := a.src.Allowed(server, m.SIDs, shareDescriptors)
+			if err != nil {
+				fail(codeOf(err))
+				continue
+			}
+			var passing []int
+			var passingSIDs []string
+			for k, row := range shareRights {
+				if slices.Contains(row, true) {
+					passing = append(passing, k)
+					passingSIDs = append(passingSIDs, m.SIDs[k])
+				}
+			}
+			if len(passing) == 0 {
+				continue
+			}
+			var classIDs []string
+			var columns []int
+			var descriptors [][]byte
+			for c, key := range keys {
+				for _, id := range byTarget[key] {
+					classIDs = append(classIDs, id)
+					columns = append(columns, c)
+					descriptors = append(descriptors, registry[id].SD)
+				}
+			}
+			matrix, err := a.src.Allowed(server, passingSIDs, descriptors)
+			if err != nil {
+				fail(codeOf(err))
+				continue
+			}
+			for j, id := range classIDs {
+				for k, index := range passing {
+					if matrix[k][j] && shareRights[index][columns[j]] {
+						readers[id] = append(readers[id], index)
+					}
 				}
 			}
 		}
@@ -459,11 +669,23 @@ func (a *agent) read(ctx context.Context, m message, t *transfer, frame func([]b
 	if !ok {
 		return refuse("bad_request")
 	}
-	rel, err := validPath(m.Path)
-	if err != nil {
+	if _, err := validPath(m.Path); err != nil {
 		return refuse("bad_request")
 	}
 	if excluded(r.Exclude, m.Path) || m.Size > int64(a.cfg.Limits.MaxFileMB)<<20 {
+		return refuse("not_found")
+	}
+	a.mu.Lock()
+	table := a.mounts[r.ID]
+	if running := a.walks[r.ID]; table.Path != r.Path && running != nil && running.listedDirs[m.Path[:max(strings.LastIndex(m.Path, "/"), 0)]] {
+		table = mountTable{Path: r.Path, Targets: running.mounts}
+	}
+	target, rest, key := physical(table.Targets, r.Path, m.Path)
+	a.mu.Unlock()
+	if r.URL == "" && table.Path != r.Path {
+		return refuse("unavailable")
+	}
+	if rest == "" {
 		return refuse("not_found")
 	}
 	now := a.now()
@@ -505,7 +727,7 @@ func (a *agent) read(ctx context.Context, m message, t *transfer, frame func([]b
 		}
 		a.mu.Unlock()
 	}()
-	f, err := a.open(ctx, r, rel, m)
+	f, err := a.open(ctx, r, target, rest, m)
 	if err != nil {
 		return refuse(codeOf(err))
 	}
@@ -514,7 +736,7 @@ func (a *agent) read(ctx context.Context, m message, t *transfer, frame func([]b
 	if err != nil {
 		return refuse(codeOf(err))
 	}
-	if fmt.Sprintf("%016x", before.ID) != m.File || before.Size != m.Size || before.Modified.UnixMilli() != m.Modified {
+	if fmt.Sprintf("%016x", before.ID^bind(key)) != m.File || before.Size != m.Size || before.Modified.UnixMilli() != m.Modified {
 		return refuse("changed")
 	}
 	buffer := make([]byte, 4+chunkSize)

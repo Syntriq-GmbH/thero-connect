@@ -29,6 +29,17 @@ roots:
 
 - `principal`: the service account as `name@REALM`, realm in upper case.
 - `server`: `windows` (the default) lets the Windows file server decide every access check, exactly as the Windows client does. `samba` makes the client compute access from the directory and the file's permissions, and confirms the [Samba prerequisites](#samba-prerequisites) for that server. A server cannot have roots of both kinds. A `samba` root on a server that does not announce itself as Samba reports `unavailable`.
+- `samba_servers`: Samba servers that are DFS link targets but host no root, listed by fully qualified name. The same prerequisites apply. A Samba target missing from this list gets no readers.
+
+## DFS namespaces
+
+A root may be a domain based (`\\corp.example\projects`) or standalone (`\\fs01.corp.example\projects`) namespace path. See [DFS namespaces](../README.md#dfs-namespaces) for what Thero indexes and who can read it. On Linux:
+
+- Domain namespaces are found through the DNS records `_ldap._tcp.dc._msdcs.<domain>`, and only domain controllers that the directory lists as domain controllers are asked for referrals.
+- The client never connects to the domain name itself. Every file is listed, checked and read on the server the referral names.
+- Windows namespace servers need `DfsDnsConfig=1`, so referrals carry fully qualified names. Short names and IP addresses in referrals are skipped and the link is reported incomplete.
+- Samba namespace servers work with `follow symlinks = no`, because the client resolves every link through a referral. Samba lets other DFS clients through a link only with `follow symlinks = yes` on the namespace share; a share set that way must hold no symlinks other than DFS links, since prerequisite 6 covers the files stored in it.
+- A server that does not answer a referral request is tried for at most 10 seconds and then skipped for referrals for 2 minutes. Listing, checking and reading a root are not affected.
 
 ## Service account and keytab
 
@@ -182,7 +193,7 @@ Enable it with `sudo systemctl enable --now thero-connect-keytab.timer`. After a
 - An existing logon of a user can keep a removed group for the lifetime of the user's Kerberos tickets (up to 10 hours) and Samba's caches. Thero always reports the result of a fresh logon, as the Windows client does.
 - The SMB pipes for share permissions and SAMR support only AES-128 encryption. A file server that requires encryption server-wide with AES-256 ciphers only reports `unavailable`. Encryption required per share works for walk and read.
 - A clock skew over 5 minutes, unreachable domain DNS or no reachable global catalog makes roots `unavailable`.
-- DFS namespaces, NTLM, LDAPS and gMSA are not supported.
+- NTLM, LDAPS and gMSA are not supported.
 - SharePoint limits are listed in [README.md](../README.md#sharepoint-server).
 - For Samba file servers the client finds the domain controllers through DNS (`_ldap._tcp.dc._msdcs.<domain>`) and takes group memberships from any server that proves a Kerberos key for `ldap/<name>/<domain>`. Protect name resolution of the connector host (a trusted resolver, no unsolicited IPv6 router advertisements or DHCPv6) and allow only administrators to register `ldap/` service names. Windows file servers do not depend on this, because they decide every access check themselves.
 

@@ -18,11 +18,13 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+const nerrDfsNoSuchVolume = windows.Errno(2662)
+
 type windowsSource struct{}
 
 func newSource(dir, principal string, samba map[string]bool) (core.Source, error) {
 	if principal != "" || len(samba) > 0 {
-		return nil, errors.New("principal and server: samba need the Linux client")
+		return nil, errors.New("principal, server: samba and samba_servers need the Linux client")
 	}
 	return windowsSource{}, nil
 }
@@ -118,36 +120,53 @@ type secBufferDesc struct {
 	buffers *secBuffer
 }
 
+type dfsInfo3 struct {
+	entryPath        *uint16
+	comment          *uint16
+	state            uint32
+	numberOfStorages uint32
+	storage          *dfsStorageInfo
+}
+
+type dfsStorageInfo struct {
+	state      uint32
+	serverName *uint16
+	shareName  *uint16
+}
+
 type berval struct {
 	length uint32
 	value  *byte
 }
 
 const (
-	ldapOptReferrals       = 0x08
-	ldapOptProtocolVersion = 0x11
-	ldapOptSign            = 0x95
-	ldapOptEncrypt         = 0x96
-	ldapAuthNegotiate      = 0x0486
-	ldapScopeBase          = 0
-	ldapScopeSubtree       = 2
-	ldapNoSuchObject       = 0x20
-	secpkgCredOutbound     = 2
-	authIdentityVersion    = 0x200
-	authIdentityUnicode    = 2
-	iscReqAllocateMemory   = 0x100
-	iscReqConnection       = 0x800
-	iscRetDelegate         = 0x1
-	negotiateFlags         = iscReqAllocateMemory | iscReqConnection
-	securityNativeDrep     = 0x10
-	secbufferToken         = 2
-	secEOK                 = 0
-	secIContinueNeeded     = 0x00090312
+	ldapOptReferrals                   = 0x08
+	ldapOptProtocolVersion             = 0x11
+	ldapOptSign                        = 0x95
+	ldapOptEncrypt                     = 0x96
+	ldapAuthNegotiate                  = 0x0486
+	ldapScopeBase                      = 0
+	ldapScopeSubtree                   = 2
+	ldapNoSuchObject                   = 0x20
+	secpkgCredOutbound                 = 2
+	authIdentityVersion                = 0x200
+	authIdentityUnicode                = 2
+	iscReqAllocateMemory               = 0x100
+	iscReqConnection                   = 0x800
+	iscRetDelegate                     = 0x1
+	negotiateFlags                     = iscReqAllocateMemory | iscReqConnection
+	securityNativeDrep                 = 0x10
+	secbufferToken                     = 2
+	secEOK                             = 0
+	secIContinueNeeded                 = 0x00090312
+	ioReparseTagDFS                    = 0x8000000A
+	fileNetworkPhysicalNameInformation = 49
 )
 
 var (
 	netapi32                                 = windows.NewLazySystemDLL("netapi32.dll")
 	procNetShareGetInfo                      = netapi32.NewProc("NetShareGetInfo")
+	procNetDfsGetClientInfo                  = netapi32.NewProc("NetDfsGetClientInfo")
 	authz                                    = windows.NewLazySystemDLL("authz.dll")
 	procAuthzInitializeRemoteResourceManager = authz.NewProc("AuthzInitializeRemoteResourceManager")
 	procAuthzInitializeContextFromSid        = authz.NewProc("AuthzInitializeContextFromSid")
@@ -187,6 +206,8 @@ func sentinel(err error) error {
 		return core.ErrNotFound
 	case errors.Is(err, windows.ERROR_SHARING_VIOLATION), errors.Is(err, windows.ERROR_LOCK_VIOLATION):
 		return core.ErrBusy
+	case errors.Is(err, windows.ERROR_BAD_NETPATH), errors.Is(err, windows.ERROR_UNEXP_NET_ERR), errors.Is(err, windows.ERROR_NETNAME_DELETED), errors.Is(err, windows.ERROR_SEM_TIMEOUT), errors.Is(err, windows.ERROR_NETWORK_UNREACHABLE), errors.Is(err, windows.ERROR_HOST_UNREACHABLE):
+		return fmt.Errorf("%w: %v", core.ErrUnavailable, err)
 	}
 	return err
 }
@@ -263,11 +284,42 @@ func openInShare(path string, access, share, flags uint32, directory bool) (wind
 	if err == nil && (attributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != directory {
 		err = core.ErrDenied
 	}
+	if err == nil {
+		err = guard(handle, current)
+	}
 	if err != nil {
 		windows.CloseHandle(handle)
 		return 0, err
 	}
 	return handle, nil
+}
+
+func guard(handle windows.Handle, path string) error {
+	buffer := make([]uint32, (4+2*len(utf16.Encode([]rune(path)))+64+3)/4)
+	var iosb windows.IO_STATUS_BLOCK
+	if err := windows.NtQueryInformationFile(handle, &iosb, (*byte)(unsafe.Pointer(&buffer[0])), uint32(len(buffer)*4), fileNetworkPhysicalNameInformation); err != nil {
+		return fmt.Errorf("%w: physical name of %s: %v", core.ErrUnavailable, path, err)
+	}
+	if buffer[0]%2 != 0 || int(buffer[0]) > (len(buffer)-1)*4 {
+		return fmt.Errorf("%w: physical name of %s has length %d", core.ErrUnavailable, path, buffer[0])
+	}
+	name := string(utf16.Decode(unsafe.Slice((*uint16)(unsafe.Pointer(&buffer[1])), buffer[0]/2)))
+	if !physicalMatches(name, path) {
+		return fmt.Errorf("%w: %s is served as %q", core.ErrUnavailable, path, name)
+	}
+	return nil
+}
+
+func physicalMatches(name, path string) bool {
+	name = strings.TrimPrefix(name, `\`)
+	if strings.HasPrefix(name, ";") {
+		index := strings.Index(name, `\`)
+		if index < 0 {
+			return false
+		}
+		name = name[index:]
+	}
+	return strings.EqualFold(strings.TrimPrefix(name, `\`), strings.TrimPrefix(path, `\\`))
 }
 
 func securityBytes(sd *windows.SECURITY_DESCRIPTOR) []byte {
@@ -280,7 +332,6 @@ func (windowsSource) List(dir string) ([]core.Entry, error) {
 		return nil, err
 	}
 	defer windows.CloseHandle(handle)
-	skipped := uint32(windows.FILE_ATTRIBUTE_REPARSE_POINT | windows.FILE_ATTRIBUTE_OFFLINE | windows.FILE_ATTRIBUTE_RECALL_ON_OPEN | windows.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
 	buffer := make([]uint64, 8192)
 	var entries []core.Entry
 	for {
@@ -293,17 +344,8 @@ func (windowsSource) List(dir string) ([]core.Entry, error) {
 		}
 		for offset := uintptr(0); ; {
 			info := (*fileIDBothDirInfo)(unsafe.Add(unsafe.Pointer(&buffer[0]), offset))
-			name := windows.UTF16ToString(unsafe.Slice(&info.fileName[0], info.fileNameLength/2))
-			if name != "." && name != ".." && info.fileAttributes&skipped == 0 {
-				entries = append(entries, core.Entry{
-					Name:     name,
-					Dir:      info.fileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0,
-					ID:       uint64(info.fileID),
-					Size:     info.endOfFile,
-					Created:  core.Filetime(info.creationTime),
-					Modified: core.Filetime(info.lastWriteTime),
-					Changed:  core.Filetime(info.changeTime),
-				})
+			if entry, ok := entryOf(info); ok {
+				entries = append(entries, entry)
 			}
 			if info.nextEntryOffset == 0 {
 				break
@@ -311,6 +353,26 @@ func (windowsSource) List(dir string) ([]core.Entry, error) {
 			offset += uintptr(info.nextEntryOffset)
 		}
 	}
+}
+
+func entryOf(info *fileIDBothDirInfo) (core.Entry, bool) {
+	name := windows.UTF16ToString(unsafe.Slice(&info.fileName[0], info.fileNameLength/2))
+	link := uint32(windows.FILE_ATTRIBUTE_DIRECTORY | windows.FILE_ATTRIBUTE_REPARSE_POINT)
+	recalled := uint32(windows.FILE_ATTRIBUTE_OFFLINE | windows.FILE_ATTRIBUTE_RECALL_ON_OPEN | windows.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+	isLink := info.fileAttributes&link == link && info.eaSize == ioReparseTagDFS && info.fileAttributes&recalled == 0
+	if name == "." || name == ".." || !isLink && info.fileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|recalled) != 0 {
+		return core.Entry{}, false
+	}
+	return core.Entry{
+		Name:     name,
+		Dir:      info.fileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0,
+		Link:     isLink,
+		ID:       uint64(info.fileID),
+		Size:     info.endOfFile,
+		Created:  core.Filetime(info.creationTime),
+		Modified: core.Filetime(info.lastWriteTime),
+		Changed:  core.Filetime(info.changeTime),
+	}, true
 }
 
 func (windowsSource) Descriptor(path string) ([]byte, uint64, error) {
@@ -652,6 +714,79 @@ func (windowsSource) Open(root, rel string) (core.File, error) {
 		return nil, err
 	}
 	return windowsFile{os.NewFile(uintptr(handle), rel)}, nil
+}
+
+func (windowsSource) Referral(unc string) (core.Referral, error) {
+	if _, _, err := core.SplitUNC(unc); err != nil {
+		return core.Referral{}, fmt.Errorf("%w: %v", core.ErrUnavailable, err)
+	}
+	handle, err := openHandle(unc, windows.FILE_READ_ATTRIBUTES|windows.SYNCHRONIZE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, windows.FILE_FLAG_BACKUP_SEMANTICS)
+	if err != nil {
+		return core.Referral{}, err
+	}
+	windows.CloseHandle(handle)
+	parts := strings.Split(strings.TrimPrefix(unc, `\\`), `\`)
+	for count := len(parts); count >= 2; count-- {
+		prefix, err := windows.UTF16PtrFromString(`\\` + strings.Join(parts[:count], `\`))
+		if err != nil {
+			return core.Referral{}, fmt.Errorf("%w: %v", core.ErrUnavailable, err)
+		}
+		var info *dfsInfo3
+		status, _, _ := procNetDfsGetClientInfo.Call(uintptr(unsafe.Pointer(prefix)), 0, 0, 3, uintptr(unsafe.Pointer(&info)))
+		if status == 0 && info != nil {
+			referral, err := referralOf(unc, info)
+			windows.NetApiBufferFree((*byte)(unsafe.Pointer(info)))
+			return referral, err
+		}
+		if info != nil {
+			windows.NetApiBufferFree((*byte)(unsafe.Pointer(info)))
+		}
+		switch windows.Errno(status) {
+		case nerrDfsNoSuchVolume, windows.ERROR_NOT_FOUND, windows.ERROR_FILE_NOT_FOUND, windows.ERROR_PATH_NOT_FOUND:
+			continue
+		case windows.ERROR_ACCESS_DENIED:
+			return core.Referral{}, core.ErrDenied
+		case 0:
+			return core.Referral{}, fmt.Errorf("%w: empty dfs answer for %s", core.ErrUnavailable, unc)
+		}
+		return core.Referral{}, fmt.Errorf("%w: dfs client info for %s: %v", core.ErrUnavailable, unc, windows.Errno(status))
+	}
+	return core.Referral{}, core.ErrNotFound
+}
+
+func referralOf(unc string, info *dfsInfo3) (core.Referral, error) {
+	parts := strings.Split(strings.TrimPrefix(unc, `\\`), `\`)
+	entry := strings.Split(strings.TrimLeft(windows.UTF16PtrToString(info.entryPath), `\`), `\`)
+	if len(entry) < 2 || len(entry) > len(parts) || entry[0] == "" || info.storage == nil {
+		return core.Referral{}, fmt.Errorf("%w: dfs entry %q for %s", core.ErrUnavailable, strings.Join(entry, `\`), unc)
+	}
+	for i := 1; i < len(entry); i++ {
+		if !strings.EqualFold(entry[i], parts[i]) {
+			return core.Referral{}, fmt.Errorf("%w: dfs entry %q for %s", core.ErrUnavailable, strings.Join(entry, `\`), unc)
+		}
+	}
+	var active, others []string
+	for _, storage := range unsafe.Slice(info.storage, info.numberOfStorages) {
+		if storage.state&0x1 != 0 {
+			continue
+		}
+		target := `\\` + strings.Trim(windows.UTF16PtrToString(storage.serverName), `\`) + `\` + strings.Trim(windows.UTF16PtrToString(storage.shareName), `\`)
+		if storage.state&0x4 != 0 {
+			active = append(active, target)
+		} else {
+			others = append(others, target)
+		}
+	}
+	var sets [][]string
+	for _, set := range [][]string{active, others} {
+		if len(set) > 0 {
+			sets = append(sets, set)
+		}
+	}
+	if len(sets) == 0 {
+		return core.Referral{}, fmt.Errorf("%w: no dfs target for %s", core.ErrUnavailable, unc)
+	}
+	return core.Referral{Consumed: `\\` + strings.Join(parts[:len(entry)], `\`), Sets: sets}, nil
 }
 
 func (f windowsFile) ReadAt(p []byte, off int64) (int, error) {

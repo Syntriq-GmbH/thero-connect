@@ -34,6 +34,19 @@ A client with `url` roots indexes SharePoint Server site collections instead of 
 
 The gMSA's membership in "Windows Authorization Access Group" lets the client read the current groups of each person. `check` prints `root <id> site` and `root <id> site users`; on failure it names the reason and the service principal name, for example a rejected Kerberos ticket, a redirect or an untrusted certificate. These details stay in the local log and are never sent to Thero.
 
+## DFS namespaces
+
+A root may be a domain based or standalone DFS namespace path. The client resolves namespace paths through the Windows DFS client and then reads every folder and file from the physical share it names.
+
+- Every handle is checked against the physical path it names. When Windows serves a path from another server or share, for example because a folder turned into a DFS link during a walk, the open fails and the folder or file is reported as unavailable. This check applies to plain roots too.
+- Link targets on Samba servers need the Linux client. On this client their access check fails and they get no readers.
+- Set `DfsDnsConfig=1` on every Windows namespace server, so referrals carry fully qualified host names. Short names and IP addresses are skipped and the link stays incomplete.
+- Before Thero Connect checks a target, the Windows DFS client has already connected to the target it picked, as the service account. Harden the Thero Connect host:
+  - Restrict outgoing NTLM traffic to remote servers.
+  - Disable LLMNR and NetBIOS over TCP/IP (NBT-NS).
+  - Stop and disable the WebClient service.
+  - Require SMB signing for the SMB client.
+
 ## Install
 
 1. Download `thero-connect.exe` and `thero-connect.exe.sha256` from the latest release and compare the checksum with `Get-FileHash thero-connect.exe`. On arm64 take `thero-connect-arm64.exe` and its `.sha256` file instead and save the binary as `thero-connect.exe`.
