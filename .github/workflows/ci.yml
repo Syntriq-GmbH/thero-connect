@@ -38,3 +38,22 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go test ./...
+
+  windows-dfs:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - shell: pwsh
+        run: |
+          Install-WindowsFeature FS-DFS-Namespace -IncludeManagementTools
+          foreach ($s in 'ns','docs','replicaA','replicaB') { New-Item -ItemType Directory -Force "C:\dfs\$s" | Out-Null; New-SmbShare -Name $s -Path "C:\dfs\$s" -FullAccess 'Everyone' | Out-Null }
+          $h = $env:COMPUTERNAME
+          New-DfsnRoot -Path "\\$h\ns" -TargetPath "\\$h\ns" -Type Standalone
+          New-DfsnFolder -Path "\\$h\ns\docs" -TargetPath "\\$h\docs"
+          New-DfsnFolder -Path "\\$h\ns\replica" -TargetPath "\\$h\replicaB"
+          New-DfsnFolderTarget -Path "\\$h\ns\replica" -TargetPath "\\$h\replicaA"
+          Set-Content "C:\dfs\ns\root.txt" root; Set-Content "C:\dfs\docs\d.txt" docs; Set-Content "C:\dfs\replicaA\r.txt" a; Set-Content "C:\dfs\replicaB\r.txt" b
+      - run: go test -tags dfs -run Dfs -count=1 -v ./windows

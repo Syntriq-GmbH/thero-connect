@@ -14,13 +14,16 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Syntriq-GmbH/thero-connect/core"
+	ldap "github.com/go-ldap/ldap/v3"
 	smb2 "github.com/hirochachacha/go-smb2/v2"
 	"github.com/hirochachacha/go-smb2/v2/auth"
+	"github.com/hirochachacha/go-smb2/v2/dfs"
 	"github.com/hirochachacha/go-smb2/v2/x/protocol"
 	"github.com/hirochachacha/go-smb2/v2/x/wire"
 	"github.com/oiweiwei/go-msrpc/dcerpc"
@@ -62,10 +65,16 @@ const (
 	statusNameDeleted        = 0xC00000C9
 	statusNoMoreFiles        = 0x80000006
 	statusEndOfFile          = 0xC0000011
+	statusNotFound           = 0xC0000225
+	statusFSDriverRequired   = 0xC000019C
+	statusNotSupported       = 0xC00000BB
+	statusInvalidDevice      = 0xC0000010
 	attributeRecallOnOpen    = 0x40000
 	attributeRecallOnAccess  = 0x400000
 	callTimeout              = 60 * time.Second
 	closeTimeout             = 10 * time.Second
+	dialTimeout              = 10 * time.Second
+	downTime                 = 2 * time.Minute
 	readSize                 = 65536
 	descriptorLimit          = 131228
 	maximumAllowed           = 0x02000000
@@ -92,6 +101,7 @@ type linuxSource struct {
 	mu          sync.Mutex
 	dialing     map[string]*sync.Mutex
 	connections map[string]*connection
+	down        map[string]time.Time
 	own         string
 }
 
@@ -174,6 +184,7 @@ func newSource(dir, principal string, samba map[string]bool) (core.Source, error
 		ldap:        ldapClient,
 		dialing:     map[string]*sync.Mutex{},
 		connections: map[string]*connection{},
+		down:        map[string]time.Time{},
 	}, nil
 }
 
@@ -212,6 +223,11 @@ func statusError(err error) error {
 	return err
 }
 
+func dfsLink(attributes, tag uint32) bool {
+	kind := attributes & (wire.FILE_ATTRIBUTE_DIRECTORY | wire.FILE_ATTRIBUTE_REPARSE_POINT | wire.FILE_ATTRIBUTE_OFFLINE | attributeRecallOnOpen | attributeRecallOnAccess)
+	return kind == wire.FILE_ATTRIBUTE_DIRECTORY|wire.FILE_ATTRIBUTE_REPARSE_POINT && tag == wire.IO_REPARSE_TAG_DFS
+}
+
 func filetime(value wire.FiletimeDecoder) time.Time {
 	return core.Filetime(int64(uint64(value.HighDateTime())<<32 | uint64(value.LowDateTime())))
 }
@@ -220,6 +236,9 @@ func (s *linuxSource) tree(ctx context.Context, unc string) (tree, string, error
 	server, name, rel, err := splitPath(unc)
 	if err != nil {
 		return tree{}, "", err
+	}
+	if strings.EqualFold(server, s.domain) {
+		return tree{}, "", fmt.Errorf("%w: smb %s: the domain name is never a file server", core.ErrUnavailable, server)
 	}
 	server, name = strings.ToLower(server), strings.ToLower(name)
 	s.mu.Lock()
@@ -401,12 +420,14 @@ func (s *linuxSource) list(dir string) ([]core.Entry, error) {
 		}
 		for _, item := range items {
 			name := item.FileName()
-			if name == "." || name == ".." || item.FileAttributes()&skipped != 0 {
+			link := dfsLink(item.FileAttributes(), item.EaSize())
+			if name == "." || name == ".." || item.FileAttributes()&skipped != 0 && !link {
 				continue
 			}
 			entries = append(entries, core.Entry{
 				Name:     name,
 				Dir:      item.FileAttributes()&wire.FILE_ATTRIBUTE_DIRECTORY != 0,
+				Link:     link,
 				ID:       item.FileId(),
 				Size:     item.EndOfFile(),
 				Created:  filetime(item.CreationTime()),
@@ -489,6 +510,117 @@ func (s *linuxSource) Open(root, rel string) (core.File, error) {
 		return s.open(root, rel)
 	}
 	return file, err
+}
+
+func (s *linuxSource) Referral(unc string) (core.Referral, error) {
+	referral, err := s.referral(unc)
+	if errors.Is(err, errSessionExpired) || errors.Is(err, errRetry) {
+		return s.referral(unc)
+	}
+	return referral, err
+}
+
+func (s *linuxSource) referral(unc string) (core.Referral, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	host, share, _, err := splitPath(unc)
+	if err != nil {
+		return core.Referral{}, err
+	}
+	domain := strings.EqualFold(host, s.domain)
+	request, servers := unc, []string{host}
+	if domain {
+		request = `\\` + host + `\` + share
+		_, records, err := net.DefaultResolver.LookupSRV(ctx, "ldap", "tcp", "dc._msdcs."+s.domain)
+		if err != nil {
+			return core.Referral{}, fmt.Errorf("%w: domain controllers of %s: %v", core.ErrUnavailable, s.domain, err)
+		}
+		conn, base, err := s.directory()
+		if err != nil {
+			return core.Referral{}, err
+		}
+		result, err := conn.Search(ldap.NewSearchRequest(base, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 30, false, "(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))", []string{"dNSHostName"}, nil))
+		conn.Close()
+		if err != nil {
+			return core.Referral{}, fmt.Errorf("%w: domain controllers of %s: %v", core.ErrUnavailable, s.domain, err)
+		}
+		servers = nil
+		for _, record := range records {
+			name := strings.TrimSuffix(record.Target, ".")
+			if slices.ContainsFunc(result.Entries, func(entry *ldap.Entry) bool { return strings.EqualFold(entry.GetAttributeValue("dNSHostName"), name) }) {
+				servers = append(servers, name)
+			}
+		}
+		if len(servers) == 0 {
+			return core.Referral{}, fmt.Errorf("%w: no domain controller of %s is listed in the directory", core.ErrUnavailable, s.domain)
+		}
+	}
+	var failures []error
+	for _, server := range servers {
+		key := strings.ToLower(server)
+		s.mu.Lock()
+		failed := s.down[key]
+		s.mu.Unlock()
+		if time.Since(failed) < downTime {
+			failures = append(failures, fmt.Errorf("%w: smb %s: unreachable since %s", core.ErrUnavailable, server, failed.Format(time.RFC3339)))
+			continue
+		}
+		dialing, cancel := context.WithTimeout(ctx, dialTimeout)
+		t, _, err := s.tree(dialing, `\\`+server+`\IPC$`)
+		cancel()
+		if errors.Is(err, errSessionExpired) || errors.Is(err, errRetry) {
+			return core.Referral{}, err
+		}
+		s.mu.Lock()
+		if errors.Is(err, core.ErrUnavailable) {
+			s.down[key] = time.Now()
+		} else {
+			delete(s.down, key)
+		}
+		s.mu.Unlock()
+		if err != nil && !domain && !errors.Is(err, core.ErrUnavailable) {
+			return core.Referral{}, core.ErrNotFound
+		}
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		res, err := dfs.NewClient(t.share).GetReferrals(ctx, request)
+		switch status := code(err); status {
+		case statusAccessDenied, statusNotFound, statusFSDriverRequired, statusNotSupported, statusInvalidDevice, statusPathNotFound:
+			if domain {
+				return core.Referral{}, fmt.Errorf("%w: referral %s: %v", core.ErrUnavailable, unc, err)
+			}
+			if status == statusAccessDenied {
+				return core.Referral{}, core.ErrDenied
+			}
+			return core.Referral{}, core.ErrNotFound
+		}
+		if err != nil {
+			err = t.fail(err)
+			if errors.Is(err, errSessionExpired) || errors.Is(err, errRetry) {
+				return core.Referral{}, err
+			}
+			failures = append(failures, fmt.Errorf("%s: %w", server, err))
+			continue
+		}
+		if len(res.Entries) == 0 || slices.ContainsFunc(res.Entries, func(entry dfs.ReferralEntry) bool { return entry.Flags&dfs.FlagNameList != 0 }) {
+			return core.Referral{}, fmt.Errorf("%w: referral %s: no usable target", core.ErrUnavailable, unc)
+		}
+		referral := core.Referral{Consumed: `\\` + strings.Trim(res.Prefix, `\`)}
+		for i, entry := range res.Entries {
+			if i == 0 || entry.Flags&dfs.FlagTargetSetBoundary != 0 {
+				referral.Sets = append(referral.Sets, nil)
+			}
+			target := `\\` + strings.Trim(entry.NetworkAddress, `\`)
+			if domain && strings.EqualFold(target, referral.Consumed) {
+				return core.Referral{}, fmt.Errorf("%w: referral %s: the domain refers to itself", core.ErrUnavailable, unc)
+			}
+			referral.Sets[len(referral.Sets)-1] = append(referral.Sets[len(referral.Sets)-1], target)
+		}
+		return referral, nil
+	}
+	return core.Referral{}, fmt.Errorf("%w: referral %s: %v", core.ErrUnavailable, unc, errors.Join(failures...))
 }
 
 func (s *linuxSource) open(root, rel string) (core.File, error) {
@@ -641,6 +773,9 @@ func (s *linuxSource) dial(ctx context.Context, address, target string, options 
 }
 
 func (s *linuxSource) pipe(ctx context.Context, server, name string) (dcerpc.Conn, func(), error) {
+	if strings.EqualFold(server, s.domain) {
+		return nil, nil, fmt.Errorf("%w: %s is the domain name, not a server", core.ErrUnavailable, server)
+	}
 	cache, err := s.ticket("cifs/" + server)
 	if err != nil {
 		return nil, nil, err
@@ -736,6 +871,9 @@ func announced(response *srvsvc.GetInfoResponse, err error) error {
 }
 
 func (s *linuxSource) Allowed(server string, sids []string, descriptors [][]byte) ([][]bool, error) {
+	if strings.EqualFold(server, s.domain) {
+		return nil, fmt.Errorf("%w: %s is the domain name, not a server", core.ErrUnavailable, server)
+	}
 	checked := sids
 	if len(sids) == 0 {
 		own, err := s.ownSID()
