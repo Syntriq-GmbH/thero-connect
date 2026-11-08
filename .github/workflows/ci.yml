@@ -6,12 +6,40 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      windows: ${{ steps.diff.outputs.windows }}
+    steps:
+      - id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          windows=true
+          if [ -n "$PR" ]; then
+            files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '.[] | .filename, .previous_filename // empty')
+            echo "$files" | grep -qvE '^(linux|test)/|\.md$' || windows=false
+          fi
+          echo "windows=$windows" >> "$GITHUB_OUTPUT"
+
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - run: gofmt -l . | (! grep .)
@@ -28,22 +56,28 @@ jobs:
       - run: GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o thero-connect-linux-arm64 ./linux
 
   windows:
+    needs: changes
+    if: needs.changes.outputs.windows == 'true'
+    timeout-minutes: 15
     strategy:
       matrix:
         os: [windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - run: go test ./...
 
   windows-dfs:
+    needs: changes
+    if: needs.changes.outputs.windows == 'true'
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - shell: pwsh
