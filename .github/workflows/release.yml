@@ -10,11 +10,13 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+          cache: false
       - run: go vet ./...
       - run: go test ./...
       - run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/Syntriq-GmbH/thero-connect/core.version=${GITHUB_REF_NAME#v}" -o thero-connect.exe ./windows
