@@ -25,7 +25,7 @@ gotest() {
   docker run --rm --network "$THERO_SMB_PROJECT" --dns "$THERO_SMB_NET.10" --dns-search samdom.example.com \
     -v "$repo":/src -w /src -v "$THERO_SMB_PROJECT-gocache":/root/.cache -v "$THERO_SMB_PROJECT-gomod":/go/pkg/mod \
     -e THERO_SAMBA_DIR=/src/test/samba/out "$golang" \
-    go test -tags samba -run "$1" -count=1 -v ./linux
+    go test -tags samba -race -run "$1" -count=1 -v ./linux
 }
 
 tree() {
@@ -180,12 +180,15 @@ up)
   bob=$(sid bob) svc=$(sid svc-thero)
   tree dc1
   tree fs1
+  dc samba-tool spn add HTTP/localhost svc-thero
   tree fs2
   namespace
   dc samba-tool domain exportkeytab /tmp/svc-thero.keytab --principal=svc-thero@SAMDOM.EXAMPLE.COM
+  dc samba-tool domain exportkeytab /tmp/http.keytab --principal=HTTP/localhost@SAMDOM.EXAMPLE.COM
   docker compose cp dc1:/tmp/svc-thero.keytab "$out/krb5.keytab"
-  dc rm /tmp/svc-thero.keytab
-  chmod 0600 "$out/krb5.keytab"
+  docker compose cp dc1:/tmp/http.keytab "$out/http.keytab"
+  dc rm /tmp/svc-thero.keytab /tmp/http.keytab
+  chmod 0600 "$out/krb5.keytab" "$out/http.keytab"
   ;;
 fresh)
   gotest '^TestSambaFresh$'
@@ -193,10 +196,13 @@ fresh)
   ;;
 truth)
   truth "dc1 fs1 fs2" "alice bob dave" "$out/truth.json"
+  for user in alice bob; do
+    echo "$user" $(dc ldbsearch -H /var/lib/samba/private/sam.ldb -b "CN=$user,CN=Users,DC=samdom,DC=example,DC=com" -s base objectSid tokenGroups | awk '/^(objectSid|tokenGroups): /{print $2}')
+  done > "$out/groups.txt"
   echo "truth: $(grep -o '"read":true' "$out/truth.json" | wc -l | tr -d ' ') of $(grep -o '"read":' "$out/truth.json" | wc -l | tr -d ' ') reads succeed"
   ;;
 test)
-  gotest '^TestSamba$'
+  gotest '^TestSamba(|Negotiate|Members)$'
   ;;
 dfs)
   gotest '^TestSambaDFS$'

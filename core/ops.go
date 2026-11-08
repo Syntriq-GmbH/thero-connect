@@ -57,6 +57,7 @@ type agent struct {
 	walks   map[string]*walkState
 	cache   map[string]map[string]cachedClass
 	mounts  map[string]mountTable
+	sites   *sites
 }
 
 type mountTable struct {
@@ -175,6 +176,9 @@ func newAgent(dir string, cfg config, src Source) (*agent, error) {
 				}
 			}
 		}
+	}
+	if len(cfg.Roots) > 0 && cfg.Roots[0].URL != "" {
+		a.sites = newSites(src)
 	}
 	return a, nil
 }
@@ -307,6 +311,12 @@ func (a *agent) walk(m message) any {
 	r, ok := a.root(m.Root)
 	if !ok {
 		return failure(m.ID, "bad_request", "unknown root")
+	}
+	if r.URL != "" {
+		return a.siteWalk(m, r)
+	}
+	if m.Changes {
+		return failure(m.ID, "bad_request", "changes on a file share")
 	}
 	a.walkMu.Lock()
 	defer a.walkMu.Unlock()
@@ -469,6 +479,13 @@ func (a *agent) walk(m message) any {
 	return pageMessage{Type: "page", ID: m.ID, Cursor: w.cursor, Entries: entries, Incomplete: incomplete}
 }
 
+func (a *agent) open(ctx context.Context, r root, target, rest string, m message) (File, error) {
+	if r.URL != "" {
+		return a.sites.open(ctx, r, m.Path)
+	}
+	return a.src.Open(target, strings.ReplaceAll(rest, "/", `\`))
+}
+
 func (a *agent) principals(m message) any {
 	emails := []string{}
 	unique := map[string]bool{}
@@ -507,7 +524,36 @@ func (a *agent) access(m message) any {
 	slices.Sort(ids)
 	readers := map[string][]int{}
 	errs := []rootError{}
+	var siteClasses []classReaders
+	var members []Member
+	var membersErr error
+	ctx, cancel := context.WithTimeout(context.Background(), accessTime)
+	defer cancel()
+	if a.sites != nil {
+		members, membersErr = a.src.Members(m.SIDs)
+		if membersErr == nil && len(members) != len(m.SIDs) {
+			membersErr = ErrUnavailable
+		}
+	}
+	left := 0
 	for _, r := range a.cfg.Roots {
+		if r.URL != "" {
+			left++
+		}
+	}
+	for _, r := range a.cfg.Roots {
+		if r.URL != "" {
+			deadline, _ := ctx.Deadline()
+			share, cancel := context.WithTimeout(ctx, time.Until(deadline)/time.Duration(left))
+			left--
+			found, code := a.siteAccess(share, r, members, membersErr)
+			cancel()
+			siteClasses = append(siteClasses, found...)
+			if code != "" {
+				errs = append(errs, rootError{Root: r.ID, Code: code})
+			}
+			continue
+		}
 		table := mounts[r.ID]
 		if at, ok := walked[r.ID]; !ok || a.now().Sub(at) > snapshotAge || table.Path != r.Path {
 			errs = append(errs, rootError{Root: r.ID, Code: "unavailable"})
@@ -609,6 +655,7 @@ func (a *agent) access(m message) any {
 	for _, id := range ids {
 		classes = append(classes, classReaders{Class: id, Readers: append([]int{}, readers[id]...)})
 	}
+	classes = append(classes, siteClasses...)
 	slog.Info("access", "users", len(m.SIDs), "classes", len(classes), "errors", errs)
 	return rightsMessage{Type: "rights", ID: m.ID, Classes: classes, Errors: errs}
 }
@@ -635,7 +682,7 @@ func (a *agent) read(ctx context.Context, m message, t *transfer, frame func([]b
 	}
 	target, rest, key := physical(table.Targets, r.Path, m.Path)
 	a.mu.Unlock()
-	if table.Path != r.Path {
+	if r.URL == "" && table.Path != r.Path {
 		return refuse("unavailable")
 	}
 	if rest == "" {
@@ -680,7 +727,7 @@ func (a *agent) read(ctx context.Context, m message, t *transfer, frame func([]b
 		}
 		a.mu.Unlock()
 	}()
-	f, err := a.src.Open(target, strings.ReplaceAll(rest, "/", `\`))
+	f, err := a.open(ctx, r, target, rest, m)
 	if err != nil {
 		return refuse(codeOf(err))
 	}
@@ -726,6 +773,9 @@ func (a *agent) read(ctx context.Context, m message, t *transfer, frame func([]b
 		if err != nil {
 			return nil
 		}
+	}
+	if extra, _ := f.ReadAt(buffer[4:5], sent); extra > 0 {
+		return refuse("changed")
 	}
 	after, err := f.Info()
 	if err != nil || after.ID != before.ID || after.Size != before.Size || !after.Modified.Equal(before.Modified) {

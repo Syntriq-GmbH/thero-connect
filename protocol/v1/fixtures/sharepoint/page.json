@@ -1,0 +1,32 @@
+{
+  "type": "page",
+  "id": 7,
+  "cursor": "",
+  "entries": [
+    {
+      "path": "Shared Documents/Reports/q1.pdf",
+      "file": "8c1f2a9b00000600",
+      "size": 123456,
+      "created": 1761900000000,
+      "modified": 1761990000000,
+      "class": "7c9e6679f1a24b2c8d3e5f60718293a4",
+      "url": "https://intranet.corp.example/sites/hr/Shared%20Documents/Reports/q1.pdf"
+    },
+    {
+      "path": "Lists/Tickets/17_.000.md",
+      "file": "41d07e3300000400",
+      "size": 412,
+      "created": 1761900000000,
+      "modified": 1761990000000,
+      "class": "0d1e2f3a4b5c6d7e8f90a1b2c3d4e5f6",
+      "url": "https://intranet.corp.example/sites/hr/Lists/Tickets/DispForm.aspx?ID=17",
+      "title": "Printer on floor 3"
+    }
+  ],
+  "incomplete": [
+    "teams/archive/Lists/Old"
+  ],
+  "deleted": [
+    "Shared Documents/Reports/q0.pdf"
+  ]
+}

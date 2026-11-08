@@ -9,7 +9,7 @@
 - The Kerberos realm is the upper case DNS domain (`corp.example` and `CORP.EXAMPLE`). Thero users and file servers are in that domain; other domains and forests are not supported.
 - File servers named by their fully qualified name in every root (`\\fs01.corp.example\finance`). Short names, aliases and IP addresses are refused.
 - Outbound TCP 443 to the link host that Thero names in the install command. A proxy must not inspect TLS for that host.
-- From the host to the domain: TCP 88 (Kerberos) and 389 (LDAP) to the domain controllers, TCP 445 to every file server, and for Windows file servers TCP 135 plus the dynamic RPC ports.
+- From the host to the domain: TCP 88 (Kerberos) and 389 (LDAP) to the domain controllers, TCP 445 to every file server, and for Windows file servers TCP 135 plus the dynamic RPC ports. For SharePoint roots TCP 443 to every configured SharePoint host instead of the file server ports.
 
 Authentication is Kerberos with the keytab only. There is no NTLM fallback. SMB signing is always required; SMB encryption is used when the file server requires it.
 
@@ -88,6 +88,20 @@ Windows file servers (as for the Windows client):
 Samba file servers:
 
 - SAMR access to the file server (the Samba default). Without it, allow entries for BUILTIN and server-local groups grant nothing, and deny entries for them always apply.
+
+## SharePoint Server
+
+A client with `url` roots indexes SharePoint Server site collections instead of file shares (see [config.yaml](../README.md#configyaml)). It still needs `principal`, the keytab and the directory access above. On the farm:
+
+- Give the service account a Full Read user policy on the Default zone of every web application that holds a configured site collection: Central Administration, Manage web applications, User Policy, Add Users, zone Default, account `CORP\thero-connect`, permission Full Read. Full Read includes the permission to read role assignments; without it the root reports `denied` and has no readers.
+- Register `HTTP/<host>` on the application pool account of the web application for every configured host, host-named site collections included, for example `setspn -S HTTP/intranet.corp.example CORP\sp-apppool`. When the service principal name differs from the host in `url`, set `spn` on the root.
+- Enable Integrated Windows authentication with Negotiate (Kerberos) on the zone of `url`. The client uses Kerberos from its keytab only, never NTLM, and never delegates its credentials.
+- The farm and its service principal names are in the same realm as `principal`. Cross-realm tickets are not supported.
+- Extended Protection on the IIS site of the web application must be Off or Allow, not Require. With Require every request is refused and the root is `unavailable`.
+- A certificate from an internal certification authority must be installed in the system trust store of the host, for example with `update-ca-certificates` on Debian and Ubuntu or `update-ca-trust` on RHEL. The client has no option to trust other certificates or to skip the check.
+- The service needs direct outbound HTTPS to every configured SharePoint host. It never uses a proxy for SharePoint and never follows a redirect.
+
+`check` prints `root <id> site` and `root <id> site users`; on failure it names the reason and the service principal name, for example a rejected Kerberos ticket, a redirect or an untrusted certificate. These details stay in the journal and are never sent to Thero.
 
 ## Samba prerequisites
 
@@ -180,6 +194,7 @@ Enable it with `sudo systemctl enable --now thero-connect-keytab.timer`. After a
 - The SMB pipes for share permissions and SAMR support only AES-128 encryption. A file server that requires encryption server-wide with AES-256 ciphers only reports `unavailable`. Encryption required per share works for walk and read.
 - A clock skew over 5 minutes, unreachable domain DNS or no reachable global catalog makes roots `unavailable`.
 - NTLM, LDAPS and gMSA are not supported.
+- SharePoint limits are listed in [README.md](../README.md#sharepoint-server).
 - For Samba file servers the client finds the domain controllers through DNS (`_ldap._tcp.dc._msdcs.<domain>`) and takes group memberships from any server that proves a Kerberos key for `ldap/<name>/<domain>`. Protect name resolution of the connector host (a trusted resolver, no unsolicited IPv6 router advertisements or DHCPv6) and allow only administrators to register `ldap/` service names. Windows file servers do not depend on this, because they decide every access check themselves.
 
 ## Build

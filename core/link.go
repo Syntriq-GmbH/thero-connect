@@ -50,6 +50,7 @@ type pageMessage struct {
 	Cursor     string      `json:"cursor"`
 	Entries    []pageEntry `json:"entries"`
 	Incomplete []string    `json:"incomplete"`
+	Deleted    []string    `json:"deleted,omitempty"`
 }
 
 type pageEntry struct {
@@ -59,6 +60,8 @@ type pageEntry struct {
 	Created  int64   `json:"created"`
 	Modified int64   `json:"modified"`
 	Class    *string `json:"class"`
+	URL      string  `json:"url,omitempty"`
+	Title    string  `json:"title,omitempty"`
 }
 
 type usersMessage struct {
@@ -129,6 +132,7 @@ type message struct {
 	CA       string   `json:"ca"`
 	Code     string   `json:"code"`
 	Message  string   `json:"message"`
+	Changes  bool     `json:"changes"`
 }
 
 type identity struct {

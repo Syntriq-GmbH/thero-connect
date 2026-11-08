@@ -5,22 +5,39 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"io"
-	"maps"
-	"os"
-	"path/filepath"
-	"runtime"
-	"slices"
-	"strings"
-	"testing"
-	"time"
-
+	"fmt"
 	"github.com/Syntriq-GmbH/thero-connect/core"
+	ldap "github.com/go-ldap/ldap/v3"
 	smb2 "github.com/hirochachacha/go-smb2/v2"
 	"github.com/hirochachacha/go-smb2/v2/dfs"
 	"github.com/hirochachacha/go-smb2/v2/x/wire"
+	"github.com/oiweiwei/gokrb5.fork/v9/gssapi"
+	"github.com/oiweiwei/gokrb5.fork/v9/keytab"
+	"github.com/oiweiwei/gokrb5.fork/v9/spnego"
+	"github.com/oiweiwei/gokrb5.fork/v9/types"
+	"io"
+	"maps"
+	"math/big"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
 )
 
 const (
@@ -319,6 +336,136 @@ func TestSamba(t *testing.T) {
 	time.Sleep(time.Second)
 	if after := runtime.NumGoroutine(); after > before+5 {
 		t.Errorf("goroutines grew from %d to %d over 10 rights cycles", before, after)
+	}
+}
+
+func TestSambaNegotiate(t *testing.T) {
+	s, dir, _ := lab(t)
+	keys, err := keytab.Load(filepath.Join(dir, "http.keytab"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), DNSNames: []string{"localhost"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, _ := x509.ParseCertificate(der)
+	var mu sync.Mutex
+	var seen []string
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(r.Header.Get("Authorization"), "Negotiate "))
+		var token spnego.SPNEGOToken
+		var mech spnego.KRB5Token
+		if err != nil || token.Unmarshal(raw) != nil || mech.Unmarshal(token.NegTokenInit.MechTokenBytes) != nil {
+			http.Error(w, "no token", http.StatusBadRequest)
+			return
+		}
+		if ok, err := mech.APReq.Verify(keys, 5*time.Minute, types.HostAddress{}, nil); !ok || err != nil {
+			http.Error(w, "not verified", http.StatusBadRequest)
+			return
+		}
+		mechs := token.NegTokenInit.MechTypes
+		checksum := mech.APReq.Authenticator.Cksum.Checksum
+		mu.Lock()
+		seen = append(seen, fmt.Sprintf("%s %s %v %v %x", r.URL.Path, mech.APReq.Authenticator.CName.PrincipalNameString(), core.KerberosToken(raw) == nil, len(mechs) == 1 && mechs[0].Equal(gssapi.OIDKRB5.OID()), checksum))
+		mu.Unlock()
+		w.Write([]byte(`{"Id":"web"}`))
+	})
+	server := httptest.NewUnstartedServer(spnego.SPNEGOKRB5Authenticate(inner, keys))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}
+	server.StartTLS()
+	defer server.Close()
+	_, port, _ := net.SplitHostPort(server.Listener.Addr().String())
+	roots := x509.NewCertPool()
+	roots.AddCert(leaf)
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}}}
+
+	for range 2 {
+		token, err := s.Negotiate("HTTP/localhost")
+		if err != nil {
+			t.Fatal(err)
+		}
+		request, _ := http.NewRequest(http.MethodGet, "https://localhost:"+port+"/_api/web", nil)
+		request.Header.Set("Authorization", "Negotiate "+token)
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK || string(body) != `{"Id":"web"}` {
+			t.Fatalf("status %d: %s", response.StatusCode, body)
+		}
+	}
+	want := "/_api/web svc-thero true true 10000000" + strings.Repeat("00", 16) + "30000000"
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 || seen[0] != want || seen[1] != want {
+		t.Fatalf("server saw %q, want twice %q", seen, want)
+	}
+	if _, err := s.Negotiate("HTTP/nosuch"); !errors.Is(err, core.ErrUnavailable) || !strings.Contains(err.Error(), "HTTP/nosuch") {
+		t.Fatalf("unknown SPN: %v", err)
+	}
+}
+
+func TestSambaMembers(t *testing.T) {
+	s, dir, accounts := lab(t)
+	raw, err := os.ReadFile(filepath.Join(dir, "groups.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	truth := map[string][]string{}
+	for _, line := range strings.Split(strings.TrimSpace(strings.ToLower(string(raw))), "\n") {
+		fields := strings.Fields(line)
+		truth[fields[0]] = fields[1:]
+	}
+	conn, base, err := s.directory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	named := map[string]string{}
+	for _, name := range []string{"Finance", "Outer", "DL_Report", "FS1$"} {
+		result, err := conn.Search(ldap.NewSearchRequest(base, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 2, 30, false, "(sAMAccountName="+ldap.EscapeFilter(name)+")", []string{"objectSid"}, nil))
+		if err != nil || len(result.Entries) != 1 {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if named[name], _, err = core.SIDString(result.Entries[0].GetEqualFoldRawAttributeValue("objectSid")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conn.Close()
+	alice, bob := accounts["alice"].SID, accounts["bob"].SID
+	unknown := alice[:strings.LastIndex(alice, "-")] + "-999999"
+	sids := []string{alice, bob, unknown, named["Finance"], named["FS1$"], "S-1-5-21-1-2-3-1105"}
+	members, err := s.Members(sids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != len(sids) {
+		t.Fatalf("got %d members for %d sids", len(members), len(sids))
+	}
+	for k, name := range []string{"alice", "bob"} {
+		member := members[k]
+		got := slices.Sorted(slices.Values(member.SIDs))
+		want := slices.Sorted(slices.Values(truth[name]))
+		if member.Login != `i:0#.w|samdom\`+name || member.SID != strings.ToLower(sids[k]) || member.SIDs[0] != member.SID || len(want) < 3 || !slices.Equal(got, want) {
+			t.Errorf("%s: %+v, want SIDs %v", name, member, want)
+		}
+		for _, group := range []string{"Finance", "Outer", "DL_Report"} {
+			if slices.Contains(member.SIDs, strings.ToLower(named[group])) != (name == "alice") {
+				t.Errorf("%s: membership of %s wrong in %v", name, group, member.SIDs)
+			}
+		}
+	}
+	for k, sid := range sids[2:] {
+		if !reflect.DeepEqual(members[k+2], core.Member{}) {
+			t.Errorf("%s: %+v, want a zero member", sid, members[k+2])
+		}
 	}
 }
 

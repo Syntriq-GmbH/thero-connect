@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -44,6 +45,7 @@ import (
 	"github.com/oiweiwei/gokrb5.fork/v9/credentials"
 	"github.com/oiweiwei/gokrb5.fork/v9/iana/nametype"
 	"github.com/oiweiwei/gokrb5.fork/v9/keytab"
+	"github.com/oiweiwei/gokrb5.fork/v9/spnego"
 	"github.com/oiweiwei/gokrb5.fork/v9/types"
 )
 
@@ -103,6 +105,8 @@ type linuxSource struct {
 	connections map[string]*connection
 	down        map[string]time.Time
 	own         string
+	domainSID   string
+	netbios     string
 }
 
 type connection struct {
@@ -502,6 +506,27 @@ func (s *linuxSource) descriptor(path string) ([]byte, uint64, error) {
 		return nil, 0, errors.New("invalid file internal information")
 	}
 	return bytes.Clone(security.Output()), uint64(id.IndexNumber()), nil
+}
+
+func (s *linuxSource) Negotiate(spn string) (string, error) {
+	fail := func(err error) (string, error) {
+		return "", fmt.Errorf("%w: kerberos %s: %v", core.ErrUnavailable, spn, err)
+	}
+	if err := s.ldap.AffirmLogin(); err != nil {
+		return fail(err)
+	}
+	request, err := spnego.SPNEGOClient(s.ldap, spn).InitSecContext()
+	if err != nil {
+		return fail(err)
+	}
+	token, err := request.Marshal()
+	if err != nil {
+		return fail(err)
+	}
+	if err := core.KerberosToken(token); err != nil {
+		return fail(err)
+	}
+	return base64.StdEncoding.EncodeToString(token), nil
 }
 
 func (s *linuxSource) Open(root, rel string) (core.File, error) {

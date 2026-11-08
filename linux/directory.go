@@ -378,9 +378,64 @@ func (s *linuxSource) ownSID() (string, error) {
 	return own, nil
 }
 
-func under(sid, domain string) bool {
-	rest, ok := strings.CutPrefix(sid, domain+"-")
-	return ok && domain != "" && rest != "" && !strings.Contains(rest, "-")
+func (s *linuxSource) Members(sids []string) ([]core.Member, error) {
+	conn, base, err := s.directory()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return s.members(conn, base, sids)
+}
+
+func (s *linuxSource) members(conn *ldap.Conn, base string, sids []string) ([]core.Member, error) {
+	unavailable := func(err error) ([]core.Member, error) {
+		return nil, fmt.Errorf("%w: ldap: %v", core.ErrUnavailable, err)
+	}
+	s.mu.Lock()
+	domain, netbios := s.domainSID, s.netbios
+	s.mu.Unlock()
+	if domain == "" || netbios == "" {
+		result, err := conn.Search(ldap.NewSearchRequest(base, ldap.ScopeBaseObject, ldap.NeverDerefAliases, 0, 30, false, "(objectClass=*)", []string{"objectSid"}, nil))
+		if err != nil || len(result.Entries) != 1 {
+			return unavailable(fmt.Errorf("domain sid: %v", err))
+		}
+		if domain, _, err = core.SIDString(result.Entries[0].GetEqualFoldRawAttributeValue("objectSid")); err != nil {
+			return unavailable(fmt.Errorf("domain sid: %v", err))
+		}
+		root, err := conn.Search(ldap.NewSearchRequest("", ldap.ScopeBaseObject, ldap.NeverDerefAliases, 0, 30, false, "(objectClass=*)", []string{"configurationNamingContext"}, nil))
+		if err != nil || len(root.Entries) != 1 || root.Entries[0].GetAttributeValue("configurationNamingContext") == "" {
+			return unavailable(fmt.Errorf("configuration naming context: %v", err))
+		}
+		partitions := "CN=Partitions," + root.Entries[0].GetAttributeValue("configurationNamingContext")
+		found, err := conn.Search(ldap.NewSearchRequest(partitions, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 2, 30, false, "(&(objectClass=crossRef)(nCName="+ldap.EscapeFilter(base)+"))", []string{"nETBIOSName"}, nil))
+		if err != nil || len(found.Entries) != 1 || found.Entries[0].GetAttributeValue("nETBIOSName") == "" {
+			return unavailable(fmt.Errorf("netbios name: %v", err))
+		}
+		netbios = found.Entries[0].GetAttributeValue("nETBIOSName")
+		s.mu.Lock()
+		s.domainSID, s.netbios = domain, netbios
+		s.mu.Unlock()
+	}
+	members := make([]core.Member, len(sids))
+	for k, sid := range sids {
+		if !core.InDomain(sid, domain) || strings.ContainsFunc(sid[len(domain)+1:], func(r rune) bool { return r < '0' || r > '9' }) {
+			continue
+		}
+		result, err := conn.Search(ldap.NewSearchRequest("<SID="+sid+">", ldap.ScopeBaseObject, ldap.NeverDerefAliases, 0, 30, false, "(objectClass=*)", core.MemberAttributes, nil))
+		if ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) {
+			continue
+		}
+		if err != nil {
+			return unavailable(fmt.Errorf("member %s: %v", sid, err))
+		}
+		if len(result.Entries) != 1 {
+			continue
+		}
+		if member, ok := core.MemberOf(valuesOf(result.Entries[0], core.MemberAttributes), domain, netbios); ok && member.SID == strings.ToLower(sid) {
+			members[k] = member
+		}
+	}
+	return members, nil
 }
 
 func (s *linuxSource) facts(checked, denied []string) (string, []map[string][][]byte, map[string]bool, error) {
@@ -402,7 +457,7 @@ func (s *linuxSource) facts(checked, denied []string) (string, []map[string][][]
 	}
 	users := make([]map[string][][]byte, len(checked))
 	for k, sid := range checked {
-		if !under(sid, domain) {
+		if !core.InDomain(sid, domain) {
 			continue
 		}
 		result, err := conn.Search(ldap.NewSearchRequest("<SID="+sid+">", ldap.ScopeBaseObject, ldap.NeverDerefAliases, 0, 30, false, "(objectClass=*)", userAttributes, nil))
@@ -420,7 +475,7 @@ func (s *linuxSource) facts(checked, denied []string) (string, []map[string][][]
 	}
 	var candidates []string
 	for _, sid := range denied {
-		if under(sid, domain) {
+		if core.InDomain(sid, domain) {
 			candidates = append(candidates, sid)
 		}
 	}
@@ -518,7 +573,7 @@ func bases(values map[string][][]byte, domain, account string) (map[string]bool,
 func token(values map[string][][]byte, aliasesSure, aliasesPossible []string, samrOK bool, domain, account string, denied []string, provable map[string]bool) core.Token {
 	user, ok := core.AccountOf(values, time.Now())
 	sure, possible, parsed := bases(values, domain, account)
-	if !ok || !parsed || !user.Enabled || !under(user.SID, domain) {
+	if !ok || !parsed || !user.Enabled || !core.InDomain(user.SID, domain) {
 		return core.Token{}
 	}
 	if samrOK {
@@ -535,16 +590,16 @@ func token(values map[string][][]byte, aliasesSure, aliasesPossible []string, sa
 	historyUnknown := false
 	for _, raw := range values["tokenGroups"] {
 		sid, _, _ := core.SIDString(raw)
-		historyUnknown = historyUnknown || strings.HasPrefix(sid, "S-1-5-21-") && !under(sid, domain)
+		historyUnknown = historyUnknown || strings.HasPrefix(sid, "S-1-5-21-") && !core.InDomain(sid, domain)
 	}
 	absent := map[string]bool{}
 	for _, sid := range denied {
 		switch {
 		case sid == "S-1-5-7":
 			absent[sid] = true
-		case strings.HasPrefix(sid, "S-1-5-32-") || account != domain && under(sid, account):
+		case strings.HasPrefix(sid, "S-1-5-32-") || account != domain && core.InDomain(sid, account):
 			absent[sid] = samrOK && !possible[sid]
-		case under(sid, domain):
+		case core.InDomain(sid, domain):
 			absent[sid] = !historyUnknown && provable[sid] && !possible[sid]
 		}
 	}

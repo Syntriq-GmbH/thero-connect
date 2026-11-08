@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -36,6 +37,8 @@ type config struct {
 type root struct {
 	ID      string   `yaml:"id"`
 	Path    string   `yaml:"path"`
+	URL     string   `yaml:"url"`
+	SPN     string   `yaml:"spn"`
 	Exclude []string `yaml:"exclude"`
 	Server  string   `yaml:"server"`
 }
@@ -48,6 +51,8 @@ type limits struct {
 }
 
 var rootPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+
+var spnPattern = regexp.MustCompile(`^HTTP/[A-Za-z0-9.-]+(:[0-9]+)?$`)
 
 type Platform struct {
 	Dir        string
@@ -184,8 +189,30 @@ func check(dir string) error {
 	}
 	src, err := host.Source(dir, cfg.Principal, cfg.samba)
 	if report("source", err) {
+		sites := newSites(src)
 		probe := &agent{cfg: cfg, src: src}
 		for _, r := range cfg.Roots {
+			if r.URL != "" {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				var site struct {
+					Path string `json:"ServerRelativeUrl"`
+				}
+				err := sites.get(ctx, r, http.MethodGet, apiPath(sitePath(r), "site?$select=Id,ServerRelativeUrl"), nil, &site)
+				if err == nil && site.Path != serverPath(r) {
+					err = errors.New("not a site collection URL")
+				}
+				if err != nil {
+					err = fmt.Errorf("%w (spn %s)", err, r.SPN)
+				}
+				report("root "+r.ID+" site", err)
+				err = sites.get(ctx, r, http.MethodGet, apiPath(sitePath(r), "web/siteusers?$select=Id&$top=1"), nil, &struct{}{})
+				if err != nil {
+					err = fmt.Errorf("%w (spn %s)", err, r.SPN)
+				}
+				report("root "+r.ID+" site users", err)
+				cancel()
+				continue
+			}
 			budget := referralHops
 			target, _, err := probe.locate(r.Path, "", map[string]bool{}, &budget)
 			if !report("root "+r.ID+" list", err) {
@@ -240,11 +267,45 @@ func loadConfig(dir string) (config, error) {
 	ids := map[string]bool{}
 	servers := map[string]string{}
 	cfg.samba = map[string]bool{}
-	for _, r := range cfg.Roots {
+	for i := range cfg.Roots {
+		r := &cfg.Roots[i]
 		if !rootPattern.MatchString(r.ID) || ids[r.ID] {
 			return config{}, fmt.Errorf("config.yaml: invalid or duplicate root id %q", r.ID)
 		}
 		ids[r.ID] = true
+		if (r.Path == "") == (r.URL == "") {
+			return config{}, fmt.Errorf("config.yaml: root %s: set exactly one of path and url", r.ID)
+		}
+		if (r.URL == "") != (cfg.Roots[0].URL == "") {
+			return config{}, errors.New("config.yaml: roots must all be file shares or all SharePoint sites")
+		}
+		for _, pattern := range r.Exclude {
+			if _, err := path.Match(pattern, ""); err != nil {
+				return config{}, fmt.Errorf("config.yaml: root %s: exclude %q: %w", r.ID, pattern, err)
+			}
+		}
+		if r.URL != "" {
+			if r.Server != "" {
+				return config{}, fmt.Errorf("config.yaml: root %s: server is only for file shares", r.ID)
+			}
+			site, err := url.Parse(r.URL)
+			if err != nil || site.Scheme != "https" || site.Opaque != "" || site.User != nil || site.Hostname() == "" || strings.HasSuffix(site.Host, ":") || strings.ContainsAny(r.URL, "?#") {
+				return config{}, fmt.Errorf("config.yaml: root %s: url must be https://host/path without user, query or fragment", r.ID)
+			}
+			if site.Path != "" && (!strings.HasPrefix(site.Path, "/") || strings.HasPrefix(site.Path, "//")) {
+				return config{}, fmt.Errorf("config.yaml: root %s: url path must start with a single /", r.ID)
+			}
+			if r.SPN == "" {
+				r.SPN = "HTTP/" + strings.ToLower(site.Hostname())
+			} else if !spnPattern.MatchString(r.SPN) {
+				return config{}, fmt.Errorf("config.yaml: root %s: spn must look like HTTP/host", r.ID)
+			}
+			r.URL = "https://" + strings.ToLower(site.Host) + strings.TrimRight(site.EscapedPath(), "/")
+			continue
+		}
+		if r.SPN != "" {
+			return config{}, fmt.Errorf("config.yaml: root %s: spn is only for SharePoint sites", r.ID)
+		}
 		server, _, err := SplitUNC(r.Path)
 		if err != nil {
 			return config{}, fmt.Errorf("config.yaml: root %s: %w", r.ID, err)
@@ -263,11 +324,6 @@ func loadConfig(dir string) (config, error) {
 		servers[server] = kind
 		if kind == "samba" {
 			cfg.samba[server] = true
-		}
-		for _, pattern := range r.Exclude {
-			if _, err := path.Match(pattern, ""); err != nil {
-				return config{}, fmt.Errorf("config.yaml: root %s: exclude %q: %w", r.ID, pattern, err)
-			}
 		}
 	}
 	for _, name := range cfg.SambaServers {

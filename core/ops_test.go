@@ -636,6 +636,19 @@ func TestAtomicWriteReplacesPlantedTemp(t *testing.T) {
 	}
 }
 
+func TestWalkChangesOnFileShare(t *testing.T) {
+	src := newFakeSource()
+	src.add(`\\fs01\finance\a.txt`, "content", readable("S-1-1-0"))
+	a := testAgent(t, src)
+	reply := a.walk(message{Type: "walk", ID: 1, Root: "finance", Changes: true})
+	if refusal, ok := reply.(errorMessage); !ok || refusal.Code != "bad_request" || refusal.Message != "changes on a file share" {
+		t.Fatalf("changes walk on a file share answered %+v", reply)
+	}
+	if entries := walkAll(t, a, "finance"); len(entries) != 1 || a.sites != nil {
+		t.Fatalf("file share walk after a changes request: %d entries", len(entries))
+	}
+}
+
 func dfsAgent(t *testing.T, src *fakeSource, roots ...root) *agent {
 	a, err := newAgent(t.TempDir(), config{Roots: roots, Limits: limits{MaxFileMB: 20, MaxGBPerDay: 50, MaxMbit: 100000}}, src)
 	if err != nil {

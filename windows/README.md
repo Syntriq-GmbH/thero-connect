@@ -3,12 +3,13 @@
 ## Requirements
 
 - Windows Server 2016 or later, joined to the domain, as the client host.
-- File servers on Windows Server 2012 R2 or later.
+- File servers on Windows Server 2012 R2 or later, or SharePoint Server 2016, 2019 or Subscription Edition farms (see [SharePoint Server](#sharepoint-server)).
 - The Active Directory accounts of the Thero users in the same domain as the client host. Accounts of other domains of the forest and of other forests are not matched and get no access.
 - A group managed service account (gMSA) for the service.
 - Outbound TCP 443 to the link host that Thero names in the install command. A proxy must not inspect TLS for that host.
+- For SharePoint roots, direct outbound HTTPS to every configured SharePoint host, without a proxy.
 
-Group membership, identity mappings and share permissions take effect in Thero within 15 minutes. NTFS permission edits take effect with the next walk that reaches the file (every 30 minutes, plus the duration of the walk).
+Group membership, identity mappings and share permissions take effect in Thero within 15 minutes. SharePoint limits are listed in [README.md](../README.md#sharepoint-server). NTFS permission edits take effect with the next walk that reaches the file (every 30 minutes, plus the duration of the walk).
 
 ## Service account rights
 
@@ -19,6 +20,19 @@ Group membership, identity mappings and share permissions take effect in Thero w
 - Inbound firewall rule "Netlogon Service Authz (RPC)" enabled on each file server.
 
 `install` grants the account "Log on as a service".
+
+## SharePoint Server
+
+A client with `url` roots indexes SharePoint Server site collections instead of file shares (see [config.yaml](../README.md#configyaml)). On the farm:
+
+- Give the gMSA a Full Read user policy on the Default zone of every web application that holds a configured site collection: Central Administration, Manage web applications, User Policy, Add Users, zone Default, account `DOMAIN\gmsa$`, permission Full Read. Full Read includes the permission to read role assignments; without it the root reports `denied` and has no readers.
+- Register `HTTP/<host>` on the application pool account of the web application for every configured host, host-named site collections included, for example `setspn -S HTTP/intranet.corp.example CORP\sp-apppool`. When the service principal name differs from the host in `url`, set `spn` on the root.
+- Enable Integrated Windows authentication with Negotiate (Kerberos) on the zone of `url`. The client uses Kerberos only and never falls back to NTLM, and it never delegates its credentials.
+- Extended Protection on the IIS site of the web application must be Off or Allow, not Require. With Require every request is refused and the root is `unavailable`.
+- A certificate from an internal certification authority must chain to a root in the Trusted Root Certification Authorities store of the local computer. The client has no option to trust other certificates or to skip the check.
+- The client needs direct outbound HTTPS to every configured SharePoint host. It never uses a proxy for SharePoint and never follows a redirect.
+
+The gMSA's membership in "Windows Authorization Access Group" lets the client read the current groups of each person. `check` prints `root <id> site` and `root <id> site users`; on failure it names the reason and the service principal name, for example a rejected Kerberos ticket, a redirect or an untrusted certificate. These details stay in the local log and are never sent to Thero.
 
 ## DFS namespaces
 

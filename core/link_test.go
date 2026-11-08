@@ -10,10 +10,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"github.com/coder/websocket"
 	"io"
 	"maps"
 	"math/big"
@@ -28,8 +30,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/coder/websocket"
 )
 
 func TestMain(m *testing.M) {
@@ -61,6 +61,84 @@ func TestLoadConfigServers(t *testing.T) {
 	for name, roots := range refused {
 		if _, err := load(roots); err == nil {
 			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
+func TestSiteConfig(t *testing.T) {
+	load := func(roots string) (config, error) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("principal: thero-connect@CORP.EXAMPLE\nroots:\n"+roots), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return loadConfig(dir)
+	}
+	accepted := []struct {
+		name, roots, url, spn string
+	}{
+		{"site", "  - id: a\n    url: https://intranet.corp.example/sites/hr\n", "https://intranet.corp.example/sites/hr", "HTTP/intranet.corp.example"},
+		{"root site", "  - id: a\n    url: https://projects.corp.example\n", "https://projects.corp.example", "HTTP/projects.corp.example"},
+		{"trailing slash", "  - id: a\n    url: https://Intranet.Corp.Example/sites/HR/\n", "https://intranet.corp.example/sites/HR", "HTTP/intranet.corp.example"},
+		{"root slash", "  - id: a\n    url: https://projects.corp.example/\n", "https://projects.corp.example", "HTTP/projects.corp.example"},
+		{"port", "  - id: a\n    url: https://SP01.corp.example:8443/sites/a\n", "https://sp01.corp.example:8443/sites/a", "HTTP/sp01.corp.example"},
+		{"spn", "  - id: a\n    url: https://projects.corp.example\n    spn: HTTP/sp01.corp.example\n", "https://projects.corp.example", "HTTP/sp01.corp.example"},
+		{"spn port", "  - id: a\n    url: https://projects.corp.example\n    spn: HTTP/sp01.corp.example:8443\n", "https://projects.corp.example", "HTTP/sp01.corp.example:8443"},
+		{"ip literal", "  - id: a\n    url: https://10.0.0.5/sites/a\n", "https://10.0.0.5/sites/a", "HTTP/10.0.0.5"},
+		{"escaped path", "  - id: a\n    url: https://intranet.corp.example/sites/team%20a\n", "https://intranet.corp.example/sites/team%20a", "HTTP/intranet.corp.example"},
+		{"exclude", "  - id: a\n    url: https://intranet.corp.example/sites/hr\n    exclude:\n      - Site Assets\n      - Lists/Archive\n", "https://intranet.corp.example/sites/hr", "HTTP/intranet.corp.example"},
+	}
+	for _, c := range accepted {
+		cfg, err := load(c.roots)
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		if r := cfg.Roots[0]; r.URL != c.url || r.SPN != c.spn || r.Path != "" || len(cfg.samba) != 0 {
+			t.Errorf("%s: url %q, spn %q, path %q, samba %v", c.name, r.URL, r.SPN, r.Path, cfg.samba)
+		}
+	}
+	cfg, err := load("  - id: a\n    url: https://a.corp.example/sites/x\n  - id: b\n    url: https://b.corp.example\n    spn: HTTP/b01.corp.example\n")
+	if err != nil || cfg.Roots[0].SPN != "HTTP/a.corp.example" || cfg.Roots[1].SPN != "HTTP/b01.corp.example" {
+		t.Fatalf("two sites: %+v, %v", cfg.Roots, err)
+	}
+	refused := []struct {
+		name, roots, want string
+	}{
+		{"both", "  - id: a\n    url: https://a.corp.example\n    path: \\\\fs01\\a\n", "exactly one"},
+		{"neither", "  - id: a\n    exclude:\n      - x\n", "exactly one"},
+		{"http", "  - id: a\n    url: http://a.corp.example\n", "url must be https://host/path"},
+		{"no scheme", "  - id: a\n    url: a.corp.example/sites/x\n", "url must be https://host/path"},
+		{"opaque", "  - id: a\n    url: https:a.corp.example\n", "url must be https://host/path"},
+		{"user info", "  - id: a\n    url: https://user@a.corp.example\n", "url must be https://host/path"},
+		{"password", "  - id: a\n    url: https://user:secret@a.corp.example\n", "url must be https://host/path"},
+		{"query", "  - id: a\n    url: https://a.corp.example/sites/x?a=1\n", "url must be https://host/path"},
+		{"empty query", "  - id: a\n    url: https://a.corp.example/sites/x?\n", "url must be https://host/path"},
+		{"fragment", "  - id: a\n    url: https://a.corp.example/sites/x#top\n", "url must be https://host/path"},
+		{"empty fragment", "  - id: a\n    url: https://a.corp.example/sites/x#\n", "url must be https://host/path"},
+		{"no host", "  - id: a\n    url: https:///sites/x\n", "url must be https://host/path"},
+		{"port only", "  - id: a\n    url: https://:443/sites/x\n", "url must be https://host/path"},
+		{"empty port", "  - id: a\n    url: https://a.corp.example:/sites/x\n", "url must be https://host/path"},
+		{"bad port", "  - id: a\n    url: https://a.corp.example:https/sites/x\n", "url must be https://host/path"},
+		{"double slash", "  - id: a\n    url: https://a.corp.example//sites/x\n", "single /"},
+		{"only slashes", "  - id: a\n    url: https://a.corp.example//\n", "single /"},
+		{"control", "  - id: a\n    url: \"https://a.corp.example/sites/\\tx\"\n", "url must be https://host/path"},
+		{"server on site", "  - id: a\n    url: https://a.corp.example\n    server: windows\n", "server is only"},
+		{"spn on share", "  - id: a\n    path: \\\\fs01\\a\n    spn: HTTP/fs01\n", "spn is only"},
+		{"spn lower", "  - id: a\n    url: https://a.corp.example\n    spn: http/a.corp.example\n", "spn must look like"},
+		{"spn service", "  - id: a\n    url: https://a.corp.example\n    spn: HOST/a.corp.example\n", "spn must look like"},
+		{"spn realm", "  - id: a\n    url: https://a.corp.example\n    spn: HTTP/a.corp.example@CORP.EXAMPLE\n", "spn must look like"},
+		{"spn empty host", "  - id: a\n    url: https://a.corp.example\n    spn: HTTP/\n", "spn must look like"},
+		{"spn bad port", "  - id: a\n    url: https://a.corp.example\n    spn: \"HTTP/a.corp.example:\"\n", "spn must look like"},
+		{"spn path", "  - id: a\n    url: https://a.corp.example\n    spn: HTTP/a.corp.example/x\n", "spn must look like"},
+		{"bad exclude", "  - id: a\n    url: https://a.corp.example\n    exclude:\n      - \"[\"\n", "exclude"},
+		{"duplicate id", "  - id: a\n    url: https://a.corp.example\n  - id: a\n    url: https://b.corp.example\n", "duplicate root id"},
+		{"share then site", "  - id: a\n    path: \\\\fs01\\a\n  - id: b\n    url: https://b.corp.example\n", "config.yaml: roots must all be file shares or all SharePoint sites"},
+		{"site then share", "  - id: a\n    url: https://a.corp.example\n  - id: b\n    path: \\\\fs01\\b\n", "config.yaml: roots must all be file shares or all SharePoint sites"},
+		{"unknown field", "  - id: a\n    url: https://a.corp.example\n    site: x\n", "field site not found"},
+	}
+	for _, c := range refused {
+		if _, err := load(c.roots); err == nil || !strings.Contains(err.Error(), "config.yaml: ") || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: %v", c.name, err)
 		}
 	}
 }
@@ -149,6 +227,8 @@ type fakeSource struct {
 	filters         []string
 	authzCalls      [][]string
 	tokens          map[string]Token
+	memberList      map[string]Member
+	negotiateErr    error
 	referrals       map[string]Referral
 	links           map[string]bool
 	calls           []string
@@ -312,6 +392,26 @@ func (s *fakeSource) Open(rootPath, rel string) (File, error) {
 		return nil, ErrNotFound
 	}
 	return &fakeHandle{src: s, f: f}, nil
+}
+
+func (s *fakeSource) Members(sids []string) ([]Member, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.failures["members"]; err != nil {
+		return nil, err
+	}
+	members := make([]Member, len(sids))
+	for i, sid := range sids {
+		members[i] = s.memberList[sid]
+	}
+	return members, nil
+}
+
+func (s *fakeSource) Negotiate(spn string) (string, error) {
+	if s.negotiateErr != nil {
+		return "", s.negotiateErr
+	}
+	return base64.StdEncoding.EncodeToString([]byte(spn)), nil
 }
 
 func (s *fakeSource) Referral(unc string) (Referral, error) {

@@ -111,6 +111,117 @@ func TestProcsResolve(t *testing.T) {
 	}
 }
 
+func TestSecur32Exports(t *testing.T) {
+	for _, proc := range []*windows.LazyProc{procAcquireCredentialsHandle, procInitializeSecurityContext, procFreeContextBuffer, procDeleteSecurityContext, procFreeCredentialsHandle} {
+		if err := proc.Find(); err != nil {
+			t.Errorf("%s: %v", proc.Name, err)
+		}
+	}
+}
+
+func TestAuthIdentityLayout(t *testing.T) {
+	var identity authIdentity
+	var handle secHandle
+	var buffer secBuffer
+	var description secBufferDesc
+	checks := []struct {
+		name string
+		got  uintptr
+		want uintptr
+	}{
+		{"SEC_WINNT_AUTH_IDENTITY_EXW.Length", unsafe.Offsetof(identity.length), 4},
+		{"SEC_WINNT_AUTH_IDENTITY_EXW.User", unsafe.Offsetof(identity.user), 8},
+		{"SEC_WINNT_AUTH_IDENTITY_EXW.UserLength", unsafe.Offsetof(identity.userLength), 16},
+		{"SEC_WINNT_AUTH_IDENTITY_EXW.Domain", unsafe.Offsetof(identity.domain), 24},
+		{"SEC_WINNT_AUTH_IDENTITY_EXW.DomainLength", unsafe.Offsetof(identity.domainLength), 32},
+		{"SEC_WINNT_AUTH_IDENTITY_EXW.Password", unsafe.Offsetof(identity.password), 40},
+		{"SEC_WINNT_AUTH_IDENTITY_EXW.PasswordLength", unsafe.Offsetof(identity.passwordLength), 48},
+		{"SEC_WINNT_AUTH_IDENTITY_EXW.Flags", unsafe.Offsetof(identity.flags), 52},
+		{"SEC_WINNT_AUTH_IDENTITY_EXW.PackageList", unsafe.Offsetof(identity.packageList), 56},
+		{"SEC_WINNT_AUTH_IDENTITY_EXW.PackageListLength", unsafe.Offsetof(identity.packageListLength), 64},
+		{"SEC_WINNT_AUTH_IDENTITY_EXW", unsafe.Sizeof(identity), 72},
+		{"SecHandle.dwUpper", unsafe.Offsetof(handle.upper), 8},
+		{"SecHandle", unsafe.Sizeof(handle), 16},
+		{"SecBuffer.BufferType", unsafe.Offsetof(buffer.bufferType), 4},
+		{"SecBuffer.pvBuffer", unsafe.Offsetof(buffer.buffer), 8},
+		{"SecBuffer", unsafe.Sizeof(buffer), 16},
+		{"SecBufferDesc.cBuffers", unsafe.Offsetof(description.count), 4},
+		{"SecBufferDesc.pBuffers", unsafe.Offsetof(description.buffers), 8},
+		{"SecBufferDesc", unsafe.Sizeof(description), 16},
+	}
+	for _, check := range checks {
+		if check.got != check.want {
+			t.Errorf("%s = %d, want %d", check.name, check.got, check.want)
+		}
+	}
+}
+
+func TestNoDelegation(t *testing.T) {
+	const iscReqDelegate = 0x1
+	if negotiateFlags&iscReqDelegate != 0 || negotiateFlags != 0x900 {
+		t.Fatalf("request flags %#x", negotiateFlags)
+	}
+	checks := []struct {
+		status     uint32
+		attributes uint32
+		ok         bool
+	}{
+		{secEOK, 0, true},
+		{secIContinueNeeded, 0x800, true},
+		{secEOK, iscRetDelegate, false},
+		{secIContinueNeeded, iscRetDelegate | 0x800, false},
+		{0x00090313, 0, false},
+		{0x00090314, 0, false},
+		{0x8009030e, 0, false},
+		{0x80090311, 0, false},
+		{0x80090303, 0, false},
+	}
+	for _, check := range checks {
+		err := negotiated(check.status, check.attributes, "HTTP/sp.corp.example")
+		if check.ok != (err == nil) {
+			t.Errorf("negotiated(%#x, %#x) = %v", check.status, check.attributes, err)
+		}
+		if err != nil && (!errors.Is(err, core.ErrUnavailable) || !strings.Contains(err.Error(), "HTTP/sp.corp.example")) {
+			t.Errorf("negotiated(%#x, %#x) error %q", check.status, check.attributes, err)
+		}
+	}
+	if err := negotiated(0x8009030e, 0, "HTTP/x"); !strings.Contains(err.Error(), "0x8009030e") {
+		t.Errorf("status missing from %q", err)
+	}
+}
+
+func TestNegotiateKerberosOnly(t *testing.T) {
+	src := windowsSource{}
+	for _, spn := range []string{"HTTP/localhost", "HTTP/nosuch.invalid", "HTTP/a\x00b", ""} {
+		token, err := src.Negotiate(spn)
+		if token != "" || !errors.Is(err, core.ErrUnavailable) {
+			t.Errorf("Negotiate(%q) = %q, %v", spn, token, err)
+		}
+	}
+}
+
+func TestMembersWithoutSIDs(t *testing.T) {
+	members, err := windowsSource{}.Members(nil)
+	if err != nil || len(members) != 0 {
+		t.Fatalf("Members(nil) = %v, %v", members, err)
+	}
+}
+
+func TestCrossRefFilterValue(t *testing.T) {
+	checks := map[string]string{
+		"DC=corp,DC=example":    "DC=corp,DC=example",
+		`OU=a\,b,DC=corp`:       `OU=a\5c,b,DC=corp`,
+		"DC=(x)*,DC=y":          `DC=\28x\29\2a,DC=y`,
+		"DC=a\x00b":             `DC=a\00b`,
+		"DC=ünïcode,DC=example": "DC=ünïcode,DC=example",
+	}
+	for value, want := range checks {
+		if got := ldapFilterValue.Replace(value); got != want {
+			t.Errorf("escape(%q) = %q, want %q", value, got, want)
+		}
+	}
+}
+
 func TestSentinel(t *testing.T) {
 	checks := []struct {
 		err  error
